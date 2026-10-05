@@ -44,7 +44,10 @@ pub fn provider() -> ProviderDecl {
                 secret_name: "access_token".to_string(),
             },
             request: ProviderRequestPolicyDecl {
-                prompt_cache_key: false,
+                // The official Codex CLI sends prompt_cache_key =
+                // conversation_id on every request; the host fills it
+                // with its session id when the policy is on.
+                prompt_cache_key: true,
                 store: false,
                 include_reasoning_encrypted: true,
                 previous_response_id: false,
