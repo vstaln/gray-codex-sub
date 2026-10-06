@@ -48,6 +48,11 @@ pub fn provider() -> ProviderDecl {
                 // conversation_id on every request; the host fills it
                 // with its session id when the policy is on.
                 prompt_cache_key: true,
+                // `warm_replay` opts the provider into host-side verbatim
+                // cache-warm replay: this transport is a real HTTPS endpoint
+                // the host calls itself (no relay child), and prompt_cache_key
+                // pins the session's cache shard.
+                warm_replay: true,
                 store: false,
                 include_reasoning_encrypted: true,
                 previous_response_id: false,
