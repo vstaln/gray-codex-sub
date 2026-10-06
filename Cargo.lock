@@ -691,8 +691,8 @@ dependencies = [
 
 [[package]]
 name = "gray-core"
-version = "0.1.10"
-source = "git+https://github.com/vstaln/gray.git#6fcf75a8b96ac723eef7f6633b2e459a2a2cba5a"
+version = "0.1.11"
+source = "git+https://github.com/vstaln/gray.git#99996c5990131074a01fa89e98f68b0987e9ac73"
 dependencies = [
  "async-trait",
  "futures",
@@ -708,8 +708,8 @@ dependencies = [
 
 [[package]]
 name = "gray-plugin"
-version = "0.1.10"
-source = "git+https://github.com/vstaln/gray.git#6fcf75a8b96ac723eef7f6633b2e459a2a2cba5a"
+version = "0.1.11"
+source = "git+https://github.com/vstaln/gray.git#99996c5990131074a01fa89e98f68b0987e9ac73"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -729,8 +729,8 @@ dependencies = [
 
 [[package]]
 name = "gray-provider"
-version = "0.1.10"
-source = "git+https://github.com/vstaln/gray.git#6fcf75a8b96ac723eef7f6633b2e459a2a2cba5a"
+version = "0.1.11"
+source = "git+https://github.com/vstaln/gray.git#99996c5990131074a01fa89e98f68b0987e9ac73"
 dependencies = [
  "async-trait",
  "eventsource-stream",
@@ -745,8 +745,8 @@ dependencies = [
 
 [[package]]
 name = "gray-tools"
-version = "0.1.10"
-source = "git+https://github.com/vstaln/gray.git#6fcf75a8b96ac723eef7f6633b2e459a2a2cba5a"
+version = "0.1.11"
+source = "git+https://github.com/vstaln/gray.git#99996c5990131074a01fa89e98f68b0987e9ac73"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

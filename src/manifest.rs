@@ -43,28 +43,23 @@ pub fn provider() -> ProviderDecl {
                 kind: "bearer".to_string(),
                 secret_name: "access_token".to_string(),
             },
-            // Built through `from_value` because `warm_replay` only exists
-            // on newer gray-plugin revs than the one pinned in Cargo.lock;
-            // the pinned deserializer drops the unknown key, so this stays
-            // buildable and simply sends the flag once the dep is bumped.
-            // `warm_replay` opts the provider into host-side verbatim
-            // cache-warm replay: this transport is a real HTTPS endpoint
-            // the host calls itself (no relay child), and prompt_cache_key
-            // pins the session's cache shard.
-            request: serde_json::from_value::<ProviderRequestPolicyDecl>(serde_json::json!({
+            request: ProviderRequestPolicyDecl {
                 // The official Codex CLI sends prompt_cache_key =
                 // conversation_id on every request; the host fills it
                 // with its session id when the policy is on.
-                "prompt_cache_key": true,
-                "warm_replay": true,
-                "store": false,
-                "include_reasoning_encrypted": true,
-                "previous_response_id": false,
-                "tool_choice": "auto",
-                "parallel_tool_calls": true,
-                "text_verbosity": "low",
-            }))
-            .expect("valid request policy"),
+                prompt_cache_key: true,
+                // `warm_replay` opts the provider into host-side verbatim
+                // cache-warm replay: this transport is a real HTTPS endpoint
+                // the host calls itself (no relay child), and prompt_cache_key
+                // pins the session's cache shard.
+                warm_replay: true,
+                store: false,
+                include_reasoning_encrypted: true,
+                previous_response_id: false,
+                tool_choice: Some("auto".to_string()),
+                parallel_tool_calls: Some(true),
+                text_verbosity: Some("low".to_string()),
+            },
             headers: vec![
                 ProviderHeaderDecl {
                     name: "chatgpt-account-id".to_string(),
