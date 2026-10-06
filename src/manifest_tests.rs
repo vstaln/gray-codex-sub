@@ -62,7 +62,7 @@ fn manifest_matches_protocol_12_contract() {
 fn manifest_passes_host_protocol_validation() {
     let manifest = manifest();
     assert_eq!(manifest.name, "codex-sub");
-    assert_eq!(manifest.version, "0.1.0");
+    assert_eq!(manifest.version, env!("CARGO_PKG_VERSION"));
     assert_eq!(manifest.protocol.as_deref(), Some("1.2"));
     assert_eq!(
         manifest.capabilities,
