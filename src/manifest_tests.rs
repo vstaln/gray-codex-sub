@@ -18,6 +18,27 @@ fn manifest_matches_protocol_12_contract() {
         "https://chatgpt.com/backend-api/codex"
     );
     assert_eq!(provider.transport.authorization.secret_name, "access_token");
+    // The request policy is built from a JSON literal (see `provider()`),
+    // so pin every field on the wire — a typo'd key would silently drop it.
+    let request = serde_json::to_value(&provider.transport.request).unwrap();
+    assert_eq!(request["prompt_cache_key"], serde_json::json!(true));
+    assert_eq!(request["store"], serde_json::json!(false));
+    assert_eq!(
+        request["include_reasoning_encrypted"],
+        serde_json::json!(true)
+    );
+    assert_eq!(request["previous_response_id"], serde_json::json!(false));
+    assert_eq!(request["tool_choice"], serde_json::json!("auto"));
+    assert_eq!(request["parallel_tool_calls"], serde_json::json!(true));
+    assert_eq!(request["text_verbosity"], serde_json::json!("low"));
+    // `warm_replay` is the host opt-in for verbatim cache-warm replay. It
+    // rides the wire once the pinned gray-plugin rev carries the field;
+    // before that the key is absent (never false).
+    assert!(
+        request
+            .get("warm_replay")
+            .is_none_or(|v| v.as_bool() == Some(true))
+    );
     let binding = provider.profile_binding(AUTH_METHOD_ID).unwrap();
     assert!(binding.starts_with("sha256:"));
     assert_eq!(
