@@ -6,7 +6,7 @@ use gray_plugin::{
 };
 
 pub const PLUGIN_NAME: &str = "codex-sub";
-pub const PLUGIN_VERSION: &str = "0.1.0";
+pub const PLUGIN_VERSION: &str = "0.1.1";
 pub const PROVIDER_ID: &str = "codex";
 pub const AUTH_METHOD_ID: &str = "chatgpt-subscription";
 
