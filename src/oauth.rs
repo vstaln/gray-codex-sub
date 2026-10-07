@@ -248,11 +248,18 @@ pub async fn refresh_material(
     if old_account != new_account {
         return Err(token_failure("account_changed"));
     }
-    material
-        .expires_at
-        .take_if(|value| *value > now_secs())
-        .ok_or_else(|| token_failure("invalid_grant"))?;
+    require_unexpired(&material)?;
     Ok(material)
+}
+
+/// The host treats a missing `expires_at` as a non-expiring credential,
+/// so validate without clearing it — the old `take_if` check stripped the
+/// expiry on success and the host would send the dead token forever.
+fn require_unexpired(material: &CredentialMaterial) -> Result<(), ProviderRpcError> {
+    match material.expires_at {
+        Some(expiry) if expiry > now_secs() => Ok(()),
+        _ => Err(token_failure("invalid_grant")),
+    }
 }
 
 fn material_from_token(token: TokenResponse) -> Result<CredentialMaterial, ProviderRpcError> {

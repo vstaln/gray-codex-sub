@@ -1,5 +1,44 @@
 use super::*;
 
+fn test_access_token(account_id: &str) -> String {
+    use base64::Engine;
+    let payload = serde_json::json!({
+        "https://api.openai.com/auth": {"chatgpt_account_id": account_id}
+    });
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string());
+    format!("header.{encoded}.signature")
+}
+
+#[test]
+fn refreshed_material_keeps_its_expiry() {
+    let token: TokenResponse = serde_json::from_value(serde_json::json!({
+        "access_token": test_access_token("acct-1"),
+        "expires_in": 3600,
+    }))
+    .unwrap();
+    let material = material_from_token(token).unwrap();
+    let expiry = material.expires_at.expect("token expiry");
+    assert!(expiry > now_secs());
+    // Regression: the expiry check must not strip `expires_at` — the host
+    // reads a missing expiry as a non-expiring credential and would send
+    // the dead access token forever instead of refreshing.
+    require_unexpired(&material).unwrap();
+    assert_eq!(material.expires_at, Some(expiry));
+}
+
+#[test]
+fn already_expired_material_is_rejected() {
+    let material = CredentialMaterial {
+        secrets: SecretMap::default(),
+        metadata: Default::default(),
+        expires_at: Some(1),
+    };
+    match require_unexpired(&material) {
+        Err(ProviderRpcError::Rpc(failure)) => assert_eq!(failure.code, "invalid_grant"),
+        other => panic!("expected invalid_grant, got {other:?}"),
+    }
+}
+
 #[test]
 fn pkce_s256_matches_rfc_7636_vector() {
     let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";

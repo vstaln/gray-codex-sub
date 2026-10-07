@@ -143,6 +143,10 @@ impl LoginManager {
             })
             .unwrap_or(false);
         if expired {
+            // An abandoned login still holds its callback port until
+            // cancelled — reclaim it or two stale operations leave every
+            // later `start` with no port to bind.
+            self.cancel(operation_id).await;
             ProviderAuthPoll::OperationLost
         } else {
             ProviderAuthPoll::Pending {
@@ -159,6 +163,14 @@ impl LoginManager {
             handle.abort();
         }
         self.results.lock().await.remove(operation_id);
+    }
+
+    /// Test hook: backdate an operation so the next poll sees it expired.
+    #[cfg(test)]
+    pub async fn force_expired(&self, operation_id: &str) {
+        if let Some(meta) = self.meta.lock().await.get_mut(operation_id) {
+            meta.created_at = 0;
+        }
     }
 }
 
@@ -183,3 +195,7 @@ fn random_id() -> String {
     bytes.extend_from_slice(second.as_bytes());
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
+
+#[path = "login_tests.rs"]
+#[cfg(test)]
+mod tests;
