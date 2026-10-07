@@ -682,6 +682,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
  "tokio-util",
  "url",
@@ -691,8 +692,8 @@ dependencies = [
 
 [[package]]
 name = "gray-core"
-version = "0.1.11"
-source = "git+https://github.com/vstaln/gray.git#99996c5990131074a01fa89e98f68b0987e9ac73"
+version = "0.1.12"
+source = "git+https://github.com/vstaln/gray.git#92c9021f04309719cb3e13b21903b14433f7138d"
 dependencies = [
  "async-trait",
  "futures",
@@ -708,8 +709,8 @@ dependencies = [
 
 [[package]]
 name = "gray-plugin"
-version = "0.1.11"
-source = "git+https://github.com/vstaln/gray.git#99996c5990131074a01fa89e98f68b0987e9ac73"
+version = "0.1.12"
+source = "git+https://github.com/vstaln/gray.git#92c9021f04309719cb3e13b21903b14433f7138d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -729,8 +730,8 @@ dependencies = [
 
 [[package]]
 name = "gray-provider"
-version = "0.1.11"
-source = "git+https://github.com/vstaln/gray.git#99996c5990131074a01fa89e98f68b0987e9ac73"
+version = "0.1.12"
+source = "git+https://github.com/vstaln/gray.git#92c9021f04309719cb3e13b21903b14433f7138d"
 dependencies = [
  "async-trait",
  "eventsource-stream",
@@ -745,8 +746,8 @@ dependencies = [
 
 [[package]]
 name = "gray-tools"
-version = "0.1.11"
-source = "git+https://github.com/vstaln/gray.git#99996c5990131074a01fa89e98f68b0987e9ac73"
+version = "0.1.12"
+source = "git+https://github.com/vstaln/gray.git#92c9021f04309719cb3e13b21903b14433f7138d"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

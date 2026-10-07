@@ -28,72 +28,47 @@ pub fn manifest() -> gray_plugin::Manifest {
     }
 }
 
-/// Codex provider. Requests go to the pinned ChatGPT backend; the host
-/// adds bearer, policy, and every declared header from this declaration.
+/// Codex provider. Chat requests go to the loopback relay the sidecar
+/// opens per turn (see `provider/chat`); the relay drives a pooled
+/// `codex app-server` child that holds the real ChatGPT session. The
+/// bearer is a per-turn relay token minted by the sidecar, never the
+/// user's OAuth credential. The base URL is a placeholder — the real
+/// per-turn URL comes back in `provider/chat`'s `relay_url`.
 pub fn provider() -> ProviderDecl {
     ProviderDecl {
         id: PROVIDER_ID.to_string(),
         name: "Codex backend (unofficial)".to_string(),
         transport: ProviderTransportDecl {
             kind: "openai-responses".to_string(),
-            base_url: "https://chatgpt.com/backend-api/codex"
+            base_url: "https://127.0.0.1:1/"
                 .parse()
-                .expect("pinned Codex base URL"),
+                .expect("loopback placeholder"),
             authorization: gray_plugin::ProviderAuthorizationDecl {
                 kind: "bearer".to_string(),
-                secret_name: "access_token".to_string(),
+                secret_name: "relay_token".to_string(),
             },
             request: ProviderRequestPolicyDecl {
-                // The official Codex CLI sends prompt_cache_key =
-                // conversation_id on every request; the host fills it
-                // with its session id when the policy is on.
-                prompt_cache_key: true,
-                // `warm_replay` opts the provider into host-side verbatim
-                // cache-warm replay: this transport is a real HTTPS endpoint
-                // the host calls itself (no relay child), and prompt_cache_key
-                // pins the session's cache shard.
-                warm_replay: true,
+                // The prompt cache lives inside each pooled app-server
+                // child; a host-side cache key would name nothing here.
+                prompt_cache_key: false,
+                // `warm_replay` must stay off: the transport is a per-turn
+                // loopback relay that admits exactly one request — a host
+                // replay would hit a dead port or get ADMISSION_CONSUMED.
+                warm_replay: false,
                 store: false,
                 include_reasoning_encrypted: true,
                 previous_response_id: false,
                 tool_choice: Some("auto".to_string()),
                 parallel_tool_calls: Some(true),
                 text_verbosity: Some("low".to_string()),
+                cache_ttl_secs: None,
             },
-            headers: vec![
-                ProviderHeaderDecl {
-                    name: "chatgpt-account-id".to_string(),
-                    value: None,
-                    source: Some(ProviderHeaderSourceDecl::Metadata {
-                        name: "account_id".to_string(),
-                    }),
-                    required: true,
-                },
-                ProviderHeaderDecl {
-                    name: "originator".to_string(),
-                    value: Some("gray".to_string()),
-                    source: None,
-                    required: false,
-                },
-                ProviderHeaderDecl {
-                    name: "OpenAI-Beta".to_string(),
-                    value: Some("responses=experimental".to_string()),
-                    source: None,
-                    required: false,
-                },
-                ProviderHeaderDecl {
-                    name: "session-id".to_string(),
-                    value: None,
-                    source: Some(ProviderHeaderSourceDecl::SessionId),
-                    required: true,
-                },
-                ProviderHeaderDecl {
-                    name: "x-client-request-id".to_string(),
-                    value: None,
-                    source: Some(ProviderHeaderSourceDecl::SessionId),
-                    required: true,
-                },
-            ],
+            headers: vec![ProviderHeaderDecl {
+                name: "session-id".to_string(),
+                value: None,
+                source: Some(ProviderHeaderSourceDecl::SessionId),
+                required: true,
+            }],
         },
         auth_methods: vec![AuthMethodDecl {
             id: AUTH_METHOD_ID.to_string(),
@@ -104,6 +79,7 @@ pub fn provider() -> ProviderDecl {
                 "refresh".to_string(),
                 "revoke".to_string(),
                 "models".to_string(),
+                "chat".to_string(),
             ],
         }],
     }

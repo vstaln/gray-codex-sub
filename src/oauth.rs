@@ -119,7 +119,7 @@ fn safe_header(value: &str) -> bool {
             .all(|byte| !byte.is_ascii_control() && byte != 0x7f)
 }
 
-pub fn account_id_from_access_token(access_token: &str) -> Result<String, ProviderRpcError> {
+fn access_token_claims(access_token: &str) -> Result<serde_json::Value, ProviderRpcError> {
     let mut segments = access_token.split('.');
     segments.next();
     let payload = segments
@@ -131,8 +131,11 @@ pub fn account_id_from_access_token(access_token: &str) -> Result<String, Provid
     let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload)
         .map_err(|_| token_failure("malformed account claim"))?;
-    let claims: serde_json::Value =
-        serde_json::from_slice(&decoded).map_err(|_| token_failure("malformed account claim"))?;
+    serde_json::from_slice(&decoded).map_err(|_| token_failure("malformed account claim"))
+}
+
+pub fn account_id_from_access_token(access_token: &str) -> Result<String, ProviderRpcError> {
+    let claims = access_token_claims(access_token)?;
     let account_id = claims
         .get("https://api.openai.com/auth")
         .and_then(|outer| outer.get("chatgpt_account_id"))
@@ -140,6 +143,80 @@ pub fn account_id_from_access_token(access_token: &str) -> Result<String, Provid
         .filter(|value| safe_header(value))
         .ok_or_else(|| token_failure("malformed account claim"))?;
     Ok(account_id.to_string())
+}
+
+/// The ChatGPT plan claim (`chatgpt_plan_type` under the same auth
+/// claim), when present: the app-server's external-auth login accepts it
+/// as `chatgptPlanType`. Never fatal — absent claim just means `None`.
+pub fn plan_type_from_access_token(access_token: &str) -> Option<String> {
+    let claims = access_token_claims(access_token).ok()?;
+    claims
+        .get("https://api.openai.com/auth")
+        .and_then(|outer| outer.get("chatgpt_plan_type"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+/// Blocking refresh of the mirrored credential for the app-server's
+/// `account/chatgptAuthTokens/refresh` server request. Runs on a session
+/// worker thread (not the async main loop), so it drives a private
+/// current-thread runtime; a dead refresh token is a hard failure —
+/// the host must re-authenticate.
+pub fn refresh_cached_blocking(
+    config: &OAuthConfig,
+    refresh_token: &str,
+) -> std::result::Result<CachedTokenSet, ProviderRpcError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| rpc_unavailable())?;
+    runtime.block_on(refresh_cached(config, refresh_token))
+}
+
+/// Shared grant body for the blocking wrapper: mirrors
+/// [`refresh_material`] but works from a bare refresh token and returns
+/// the cache-shape token set (no CredentialMaterial ceremony).
+pub async fn refresh_cached(
+    config: &OAuthConfig,
+    refresh_token: &str,
+) -> std::result::Result<CachedTokenSet, ProviderRpcError> {
+    let client = http_client().map_err(|_| rpc_unavailable())?;
+    let form = [
+        ("grant_type", "refresh_token".to_string()),
+        ("client_id", config.client_id.clone()),
+        ("refresh_token", refresh_token.to_string()),
+    ];
+    let token = post_token(&client, &form)
+        .await
+        .map_err(|error| match error.code.as_str() {
+            "invalid_grant" | "invalid_refresh_token" => token_failure("invalid_grant"),
+            _ => rpc_unavailable(),
+        })?;
+    let account_id = account_id_from_access_token(token.access_token())?;
+    let expires_at = now_secs()
+        .checked_add(token.expires_in as u64)
+        .ok_or_else(|| token_failure("invalid_grant"))?;
+    Ok(CachedTokenSet {
+        access_token: token.access_token().to_string(),
+        // Rotated when the grant returns one; else the old token stays.
+        refresh_token: token
+            .refresh_token()
+            .map(str::to_string)
+            .unwrap_or_else(|| refresh_token.to_string()),
+        account_id,
+        expires_at,
+        plan_type: plan_type_from_access_token(token.access_token()),
+    })
+}
+
+/// What a sidecar-run refresh produces: the fields the app-server's
+/// external-auth answer plus the on-disk cache need.
+pub struct CachedTokenSet {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub account_id: String,
+    pub expires_at: u64,
+    pub plan_type: Option<String>,
 }
 
 fn token_failure(code: &'static str) -> ProviderRpcError {

@@ -96,6 +96,9 @@ pub fn parse_models(body: &[u8]) -> Result<ProviderModelCatalog, ProviderRpcErro
                             .collect()
                     })
                     .unwrap_or_default(),
+                // No effort-mapped variants or composite slots.
+                variants: vec![],
+                slots: vec![],
             };
             models.push(model);
         }
