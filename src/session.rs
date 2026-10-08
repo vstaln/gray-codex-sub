@@ -129,7 +129,6 @@ pub struct LiveSession {
 
     last_used: Instant,
     last_prompt_at: Instant,
-    keepalive_sent: bool,
     /// The claiming turn's disconnect flag — stored so nested handling
     /// (auth refresh, interrupt) can observe it.
     cancel: Arc<AtomicBool>,
@@ -306,56 +305,78 @@ pub fn spawn(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("spawn {bin}: {e}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "spawn: no stdout pipe".to_string())?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "spawn: no stdin pipe".to_string())?;
+    // Every early return past this point must reap the child — `Child`'s
+    // Drop does not kill it.
+    let kill = |child: &mut Child| {
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            kill(&mut child);
+            return Err("spawn: no stdout pipe".to_string());
+        }
+    };
+    let stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            kill(&mut child);
+            return Err("spawn: no stdin pipe".to_string());
+        }
+    };
     let stderr_ring = Arc::new(Mutex::new(VecDeque::new()));
     if let Some(err) = child.stderr.take() {
         let ring = stderr_ring.clone();
-        std::thread::spawn(move || {
-            let reader = BufReader::new(err);
-            for line in reader.lines() {
-                let Ok(line) = line else { break };
-                if let Ok(mut r) = ring.lock() {
-                    if r.len() >= STDERR_RING {
-                        r.pop_front();
+        // Best-effort: diagnostics only. A failed thread spawn just means
+        // no stderr tail in later error strings.
+        let _ = std::thread::Builder::new()
+            .name("codex-sub-child-stderr".into())
+            .spawn(move || {
+                let reader = BufReader::new(err);
+                for line in reader.lines() {
+                    let Ok(line) = line else { break };
+                    if let Ok(mut r) = ring.lock() {
+                        if r.len() >= STDERR_RING {
+                            r.pop_front();
+                        }
+                        r.push_back(line);
                     }
-                    r.push_back(line);
+                }
+            });
+    }
+    let (tx, rx) = mpsc::channel::<Wire>();
+    let reader = std::thread::Builder::new()
+        .name("codex-sub-child-stdout".into())
+        .spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => {
+                        let _ = tx.send(Wire::Eof);
+                        return;
+                    }
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let msg = match serde_json::from_str::<Value>(trimmed) {
+                            Ok(v) => Wire::Msg(v),
+                            Err(_) => Wire::Bad,
+                        };
+                        if tx.send(msg).is_err() {
+                            return;
+                        }
+                    }
                 }
             }
         });
+    if let Err(e) = reader {
+        kill(&mut child);
+        return Err(format!("app-server stdout reader thread: {e}"));
     }
-    let (tx, rx) = mpsc::channel::<Wire>();
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => {
-                    let _ = tx.send(Wire::Eof);
-                    return;
-                }
-                Ok(_) => {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    let msg = match serde_json::from_str::<Value>(trimmed) {
-                        Ok(v) => Wire::Msg(v),
-                        Err(_) => Wire::Bad,
-                    };
-                    if tx.send(msg).is_err() {
-                        return;
-                    }
-                }
-            }
-        }
-    });
 
     let mut s = LiveSession {
         child,
@@ -382,7 +403,6 @@ pub fn spawn(
         current_turn_id: None,
         last_used: Instant::now(),
         last_prompt_at: Instant::now(),
-        keepalive_sent: false,
         cancel: cancel.clone(),
         closed: false,
     };
@@ -1081,7 +1101,6 @@ impl LiveSession {
         }
         self.last_used = Instant::now();
         self.last_prompt_at = Instant::now();
-        self.keepalive_sent = false;
     }
 
     /// Failed-but-settled turn: absorb the input so a retry continues
@@ -1096,7 +1115,6 @@ impl LiveSession {
         self.parked.clear();
         self.last_used = Instant::now();
         self.last_prompt_at = Instant::now();
-        self.keepalive_sent = false;
     }
 
     /// One cache-warming turn on an idle session. Parked calls can't
@@ -1137,7 +1155,6 @@ impl LiveSession {
             }
         }
         self.last_used = Instant::now();
-        self.keepalive_sent = true;
     }
 
     /// Terminate the child and drop the stage dir. Idempotent: `closed`
@@ -1159,7 +1176,10 @@ impl Drop for LiveSession {
 
 /// Idle sweep: kill sessions past IDLE_TIMEOUT (measured from the last
 /// real prompt, so keepalives can't immortalize a dead conversation),
-/// send one keepalive per idle stretch, drop closed handles.
+/// send a keepalive whenever upstream contact has gone stale — the
+/// cache outlives a turn by less than IDLE_TIMEOUT, so a one-shot latch
+/// would leave a live thread cold for most of its life — drop closed
+/// handles.
 fn sweep() {
     let mut pool = match POOL.lock() {
         Ok(p) => p,
@@ -1178,10 +1198,7 @@ fn sweep() {
         }
         // Suspended sessions are mid-turn forever by design: the keepalive
         // path doesn't apply, only the idle timeout above.
-        if !s.suspended
-            && !s.prompt_in_flight
-            && !s.keepalive_sent
-            && now.duration_since(s.last_used) > KEEPALIVE_AFTER
+        if !s.suspended && !s.prompt_in_flight && now.duration_since(s.last_used) > KEEPALIVE_AFTER
         {
             keepalives.push(pool.remove(i));
             continue;
@@ -1196,12 +1213,16 @@ fn sweep() {
 }
 
 /// Start the background sweeper once; the sidecar lives forever so the
-/// thread is intentionally never joined.
-pub fn start_reaper() {
-    std::thread::spawn(|| {
-        loop {
-            std::thread::sleep(REAPER_TICK);
-            sweep();
-        }
-    });
+/// thread is intentionally never joined. A host that can't spare the
+/// thread gets `Err` — the caller logs and runs without reaping.
+pub fn start_reaper() -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("codex-sub-reaper".into())
+        .spawn(|| {
+            loop {
+                std::thread::sleep(REAPER_TICK);
+                sweep();
+            }
+        })?;
+    Ok(())
 }

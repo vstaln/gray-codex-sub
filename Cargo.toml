@@ -35,3 +35,6 @@ tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 strip = true
+# Do NOT set `panic = "abort"` here: startup degrades hostile hosts
+# through catch_unwind (tokio runtime build, per-request handlers) —
+# abort would turn those back into spawn-time kills.

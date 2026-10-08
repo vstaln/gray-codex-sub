@@ -106,7 +106,11 @@ pub fn start_turn_server(
         .map_err(|e| format!("relay addr: {e}"))?
         .port();
     let used = Arc::new(AtomicBool::new(false));
-    let handle = std::thread::spawn(move || serve(listener, intents, bearer, used));
+    // Thread-starved hosts must see a clean error, not a spawn panic.
+    let handle = std::thread::Builder::new()
+        .name("codex-sub-relay".into())
+        .spawn(move || serve(listener, intents, bearer, used))
+        .map_err(|e| format!("relay thread: {e}"))?;
     Ok((port, handle))
 }
 
@@ -211,9 +215,18 @@ fn handle_conn(
         let intents = intents.clone();
         let bearer = bearer.to_string();
         let cancel = cancel.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(run_turn(&intents, &bearer, &body, &cancel));
-        });
+        let spawned = std::thread::Builder::new()
+            .name("codex-sub-turn".into())
+            .spawn(move || {
+                let _ = tx.send(run_turn(&intents, &bearer, &body, &cancel));
+            });
+        if let Err(e) = spawned {
+            let body = json!({"type": "error", "error": {
+                "type": "server_error", "message": format!("turn worker unavailable: {e}"),
+            }});
+            write_resp(s, 500, body.to_string().as_bytes());
+            return;
+        }
     }
     match wait_turn(&rx, s, &cancel, HEADER_GRACE) {
         Wait::Gone => {}

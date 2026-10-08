@@ -4,7 +4,18 @@ use std::time::Duration;
 
 use gray_plugin::{ProviderModel, ProviderModelCatalog, ProviderRpcError, ProviderRpcFailure};
 
+/// The Codex CLI's own model-catalog endpoint. Model *ids* are never
+/// pinned (the answer is enumerated), and the endpoint itself is
+/// env-overridable for when it moves.
 const MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
+const MODELS_URL_ENV: &str = "GRAY_CODEX_SUB_MODELS_URL";
+
+fn models_url() -> String {
+    std::env::var(MODELS_URL_ENV)
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| MODELS_URL.to_string())
+}
 const MAX_MODELS: usize = 128;
 const MAX_BODY_BYTES: usize = 192 * 1024;
 
@@ -27,7 +38,7 @@ pub async fn fetch_models(
     account_id: &str,
 ) -> Result<ProviderModelCatalog, ProviderRpcError> {
     let response = client
-        .get(MODELS_URL)
+        .get(models_url())
         .bearer_auth(access_token)
         .header("chatgpt-account-id", account_id)
         .header("originator", "gray")

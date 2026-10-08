@@ -65,7 +65,10 @@ pub fn codex_home() -> PathBuf {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+        // No HOME at all: a cwd-relative `.gray/` would scribble into
+        // whatever directory the host ran from (possibly read-only or
+        // the user's project). The temp dir is the safer last resort.
+        .unwrap_or_else(std::env::temp_dir);
     home.join(".gray").join("codex-home")
 }
 

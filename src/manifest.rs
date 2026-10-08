@@ -6,7 +6,9 @@ use gray_plugin::{
 };
 
 pub const PLUGIN_NAME: &str = "codex-sub";
-pub const PLUGIN_VERSION: &str = "0.1.2";
+/// Derived from Cargo.toml — a pinned literal here drifted behind
+/// release bumps once already (v0.1.3 shipped a "0.1.2" manifest).
+pub const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PROVIDER_ID: &str = "codex";
 pub const AUTH_METHOD_ID: &str = "chatgpt-subscription";
 
@@ -61,7 +63,11 @@ pub fn provider() -> ProviderDecl {
                 tool_choice: Some("auto".to_string()),
                 parallel_tool_calls: Some(true),
                 text_verbosity: Some("low".to_string()),
-                cache_ttl_secs: None,
+                // Codex's thread cache outlives a turn by ~minutes; the
+                // pool refreshes upstream contact at 10min staleness
+                // (session.rs KEEPALIVE_AFTER), so ~10min is the honest
+                // declared lifetime.
+                cache_ttl_secs: Some(600),
             },
             headers: vec![ProviderHeaderDecl {
                 name: "session-id".to_string(),
