@@ -1,6 +1,13 @@
-# gray-codex-sub
-
-> **ChatGPT/Codex subscription model-provider sidecar plugin for the [gray](https://github.com/vstaln/gray) agent harness.**
+<p align="center">
+  <img src="assets/gray-logo.svg" alt="gray" width="96">
+</p>
+<h1 align="center">gray-codex-sub</h1>
+<p align="center">Run gray turns on your ChatGPT plan — a Codex-subscription provider sidecar.</p>
+<p align="center">
+  <a href="https://github.com/vstaln/gray-codex-sub/blob/main/LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <img alt="gray plugin" src="https://img.shields.io/badge/gray-plugin-7aa2f7.svg">
+  <img alt="rust" src="https://img.shields.io/badge/built%20with-rust-orange.svg">
+</p>
 
 `gray-codex-sub` lets gray run turns on your ChatGPT plan instead of an API key. It is a protocol-1.2 provider sidecar: gray owns the agent loop, tools, approvals, and compaction — the plugin only supplies the OAuth login and the provider declaration the host uses for each Responses request.
 
@@ -43,3 +50,7 @@ For ChatGPT Plus users, the five-hour usage limit is **shared across all apps** 
 ## License
 
 MIT
+
+---
+Part of the [gray](https://github.com/vstaln/gray) plugin ecosystem —
+the open-source AI agent harness. <https://gray.alignment.id>
