@@ -160,6 +160,9 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     }
     let mut dynamic_tools: Vec<Value> = Vec::new();
     let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // The operator's allowlist (`/codex tools`, default bash-only): only
+    // passing tools reach the `dynamicTools` the turn advertises.
+    let policy = crate::settings::ToolPolicy::load();
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
         for t in tools {
             let name = t.get("name").and_then(Value::as_str).unwrap_or("");
@@ -168,6 +171,11 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
                 .and_then(Value::as_str)
                 .is_some_and(|k| k != "function")
             {
+                continue;
+            }
+            // Filter before validating: a disallowed tool is invisible
+            // here, so its name (valid or not) can never fail a turn.
+            if !policy.allows(name) {
                 continue;
             }
             if name.is_empty()

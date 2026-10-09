@@ -11,6 +11,8 @@ pub const PLUGIN_NAME: &str = "codex-sub";
 pub const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PROVIDER_ID: &str = "codex";
 pub const AUTH_METHOD_ID: &str = "chatgpt-subscription";
+/// The operator command: `/codex tools …` owns the tool allowlist.
+pub const CODEX_COMMAND: &str = "/codex";
 
 /// A protocol-1.2 manifest value. Gray validates every provider and
 /// malformed peers independently; this plugin ships exactly one valid
@@ -20,7 +22,7 @@ pub fn manifest() -> gray_plugin::Manifest {
         name: PLUGIN_NAME.to_string(),
         version: PLUGIN_VERSION.to_string(),
         tools: Vec::new(),
-        commands: Vec::new(),
+        commands: vec![CODEX_COMMAND.to_string()],
         hooks: Vec::new(),
         protocol: Some("1.2".to_string()),
         subcommands: Vec::new(),
@@ -28,6 +30,24 @@ pub fn manifest() -> gray_plugin::Manifest {
         providers: vec![provider()],
         provider_errors: Vec::new(),
     }
+}
+
+/// `command/run` result for a claimed command, `None` for names this
+/// sidecar doesn't answer. A bare `/codex` answers nothing (`{}`) so the
+/// host falls back to the provider-login shortcut — connect → model
+/// picker on Codex's rows, i.e. "switch to Codex" — while
+/// `/codex tools …` owns the tool allowlist (see [`crate::settings`]),
+/// answered as `{"text": …}`.
+pub fn run_command(name: &str, argv: &[String]) -> Option<serde_json::Value> {
+    if name == CODEX_COMMAND {
+        if argv.is_empty() {
+            return Some(serde_json::json!({}));
+        }
+        return Some(serde_json::json!({
+            "text": crate::settings::command(argv),
+        }));
+    }
+    None
 }
 
 /// Codex provider. Chat requests go to the loopback relay the sidecar

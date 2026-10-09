@@ -9,6 +9,10 @@
 //! runtime, spare threads, or a writable HOME are missing. Everything
 //! optional degrades to a per-method structured error — nothing before
 //! the read loop may panic or exit.
+//!
+//! `command/run`: a bare `/codex` answers nothing so the host's
+//! provider-login shortcut switches the session to Codex; `/codex tools …`
+//! owns the upstream tool allowlist (`{"text": …}`).
 
 use codex_sub::{chat, login, manifest, models, oauth, relay, session, setup};
 
@@ -74,6 +78,17 @@ fn main() {
             diag("manifest write failed: stdout closed");
             std::process::exit(2);
         }
+        return;
+    }
+
+    // `gray codex-sub tools …` and the REPL's `/codex tools …` land on
+    // the same file: one allowlist, no sidecar needed.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("tools")) {
+        let args: Vec<String> = std::env::args_os()
+            .skip(2)
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        println!("{}", codex_sub::settings::tools_command(&args));
         return;
     }
 
@@ -483,6 +498,23 @@ async fn handle(shared: &Shared, request: &Request) -> Result<Value, ProviderRpc
             Ok(serde_json::to_value(models).unwrap())
         }
         "provider/chat" => chat_turn(&shared.relays, params).await,
+        "command/run" => {
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let argv: Vec<String> = params
+                .get("argv")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            manifest::run_command(name, &argv)
+                .ok_or_else(|| ProviderRpcError::Protocol("unknown command".to_string()))
+        }
         "plugin/shutdown" => Ok(json!({})),
         _ => Err(ProviderRpcError::Protocol(
             "unknown provider method".to_string(),
