@@ -38,3 +38,13 @@ strip = true
 # Do NOT set `panic = "abort"` here: startup degrades hostile hosts
 # through catch_unwind (tokio runtime build, per-request handlers) —
 # abort would turn those back into spawn-time kills.
+
+# Dev builds: full DWARF bloats the binary and every edit pays the link.
+# Line tables keep file:line in panics and backtraces; deps carry none
+# (nobody steps into tokio). Need a debugger? CARGO_PROFILE_DEV_DEBUG=2
+# for that one build.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
