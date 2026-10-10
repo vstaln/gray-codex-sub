@@ -14,7 +14,7 @@
 //! provider-login shortcut switches the session to Codex; `/codex tools …`
 //! owns the upstream tool allowlist (`{"text": …}`).
 
-use codex_sub::{chat, login, manifest, models, oauth, relay, session, setup};
+use codex_sub::{chat, login, manifest, models, oauth, relay, session, setup, usage};
 
 use std::io::{BufRead, Write};
 use std::sync::{Arc, OnceLock};
@@ -36,6 +36,7 @@ fn diag(message: &str) {
 
 #[derive(Deserialize)]
 struct Request {
+    #[serde(default)]
     id: Value,
     method: String,
     #[serde(default)]
@@ -230,6 +231,13 @@ fn serve_serial(runtime: &tokio::runtime::Runtime) {
             Ok(request) => request,
             Err(_) => continue,
         };
+        if request.id.is_null() {
+            if request.method == "plugin/shutdown" {
+                session::shutdown_all();
+                return;
+            }
+            continue;
+        }
         let method = request.method.clone();
         // A handler panic unwinds block_on — catch it into one error
         // frame instead of taking the sidecar down.
@@ -275,6 +283,13 @@ fn serve_degraded() {
             Ok(request) => request,
             Err(_) => continue,
         };
+        if request.id.is_null() {
+            if request.method == "plugin/shutdown" {
+                session::shutdown_all();
+                return;
+            }
+            continue;
+        }
         let shutdown = request.method == "plugin/shutdown";
         let outcome = match request.method.as_str() {
             "plugin/manifest" => {
@@ -349,6 +364,13 @@ async fn serve(mut stdin_rx: tokio::sync::mpsc::UnboundedReceiver<String>) {
             Ok(request) => request,
             Err(_) => continue,
         };
+        if request.id.is_null() {
+            if request.method == "plugin/shutdown" {
+                session::shutdown_all();
+                return;
+            }
+            continue;
+        }
         // Each request runs as its own task so a handler panic degrades
         // to one error frame instead of taking the whole sidecar down.
         let id = request.id.clone();
@@ -476,6 +498,7 @@ async fn handle(shared: &Shared, request: &Request) -> Result<Value, ProviderRpc
             setup::clear();
             Ok(json!({"status": "unsupported"}))
         }
+        "provider/usage" => usage::handle().await,
         "provider/models" => {
             let request: ProviderModelsRequest =
                 serde_json::from_value(params).map_err(|_| invalid("provider models request"))?;
