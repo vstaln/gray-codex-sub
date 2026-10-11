@@ -1198,8 +1198,17 @@ fn sweep() {
         }
         // Suspended sessions are mid-turn forever by design: the keepalive
         // path doesn't apply, only the idle timeout above.
-        if !s.suspended && !s.prompt_in_flight && now.duration_since(s.last_used) > KEEPALIVE_AFTER
-        {
+        let due =
+            !s.suspended && !s.prompt_in_flight && now.duration_since(s.last_used) > KEEPALIVE_AFTER;
+        let newest = due
+            && !pool.iter().any(|o| {
+                !o.closed
+                    && o.surface == s.surface
+                    && o.model == s.model
+                    && o.effort == s.effort
+                    && o.last_prompt_at > s.last_prompt_at
+            });
+        if newest {
             keepalives.push(pool.remove(i));
             continue;
         }
