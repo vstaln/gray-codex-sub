@@ -132,25 +132,25 @@ pub async fn handle() -> Result<Value, ProviderRpcError> {
 fn map_usage(v: &Value, auth: &setup::CachedAuth) -> Value {
     let mut windows = Vec::new();
     let rl = v.get("rate_limit");
-    if let Some(p) = rl.and_then(|r| r.get("primary_window")).filter(|w| !w.is_null()) {
-        if let Some(w) = window(p, "primary", false) {
-            windows.push(w);
-        }
+    if let Some(p) = rl.and_then(|r| r.get("primary_window")).filter(|w| !w.is_null())
+        && let Some(w) = window(p, "primary", false)
+    {
+        windows.push(w);
     }
-    if let Some(s) = rl.and_then(|r| r.get("secondary_window")).filter(|w| !w.is_null()) {
-        if let Some(w) = window(s, "secondary", true) {
-            windows.push(w);
-        }
+    if let Some(s) = rl.and_then(|r| r.get("secondary_window")).filter(|w| !w.is_null())
+        && let Some(w) = window(s, "secondary", true)
+    {
+        windows.push(w);
     }
 
     let mut notes = Vec::new();
     if let Some(c) = v.get("credits") {
         if c.get("unlimited").and_then(Value::as_bool) == Some(true) {
             notes.push("unlimited credits".to_string());
-        } else if c.get("has_credits").and_then(Value::as_bool) == Some(true) {
-            if let Some(b) = c.get("balance").and_then(Value::as_f64) {
-                notes.push(format!("credits balance ${b:.2}"));
-            }
+        } else if c.get("has_credits").and_then(Value::as_bool) == Some(true)
+            && let Some(b) = c.get("balance").and_then(Value::as_f64)
+        {
+            notes.push(format!("credits balance ${b:.2}"));
         }
     }
     if rl.and_then(|r| r.get("limit_reached")).and_then(Value::as_bool) == Some(true) {
