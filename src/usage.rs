@@ -88,9 +88,7 @@ pub async fn handle() -> Result<Value, ProviderRpcError> {
     })?;
     if !auth.access_fresh(now_secs(), REFRESH_SKEW_SECS) {
         let rt = auth.refresh_token.clone().ok_or_else(|| {
-            ProviderRpcError::Unavailable(
-                "Codex login has no refresh token — reconnect".into(),
-            )
+            ProviderRpcError::Unavailable("Codex login has no refresh token — reconnect".into())
         })?;
         let set = oauth::refresh_cached(&oauth::OAuthConfig::default(), &rt).await?;
         auth = setup::CachedAuth {
@@ -110,7 +108,10 @@ pub async fn handle() -> Result<Value, ProviderRpcError> {
     let resp = client
         .get(USAGE_URL)
         .bearer_auth(&auth.access_token)
-        .header("chatgpt-account-id", auth.account_id.as_deref().unwrap_or_default())
+        .header(
+            "chatgpt-account-id",
+            auth.account_id.as_deref().unwrap_or_default(),
+        )
         .header("originator", "gray")
         .header("Accept", "application/json")
         .send()
@@ -132,12 +133,16 @@ pub async fn handle() -> Result<Value, ProviderRpcError> {
 fn map_usage(v: &Value, auth: &setup::CachedAuth) -> Value {
     let mut windows = Vec::new();
     let rl = v.get("rate_limit");
-    if let Some(p) = rl.and_then(|r| r.get("primary_window")).filter(|w| !w.is_null())
+    if let Some(p) = rl
+        .and_then(|r| r.get("primary_window"))
+        .filter(|w| !w.is_null())
         && let Some(w) = window(p, "primary", false)
     {
         windows.push(w);
     }
-    if let Some(s) = rl.and_then(|r| r.get("secondary_window")).filter(|w| !w.is_null())
+    if let Some(s) = rl
+        .and_then(|r| r.get("secondary_window"))
+        .filter(|w| !w.is_null())
         && let Some(w) = window(s, "secondary", true)
     {
         windows.push(w);
@@ -153,7 +158,11 @@ fn map_usage(v: &Value, auth: &setup::CachedAuth) -> Value {
             notes.push(format!("credits balance ${b:.2}"));
         }
     }
-    if rl.and_then(|r| r.get("limit_reached")).and_then(Value::as_bool) == Some(true) {
+    if rl
+        .and_then(|r| r.get("limit_reached"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
         notes.push("limit reached".to_string());
     }
 
