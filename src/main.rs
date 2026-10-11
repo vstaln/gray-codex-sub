@@ -93,6 +93,15 @@ fn main() {
         return;
     }
 
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("status")) {
+        if let Some(rt) = build_runtime() {
+            println!("{}", rt.block_on(codex_sub::status::text()));
+            return;
+        }
+        println!("Codex backend (unofficial)\n  status: (no tokio runtime)");
+        return;
+    }
+
     let Some(runtime) = build_runtime() else {
         diag("no tokio runtime available; degraded mode (manifest + errors only)");
         serve_degraded();
@@ -535,6 +544,9 @@ async fn handle(shared: &Shared, request: &Request) -> Result<Value, ProviderRpc
                         .collect()
                 })
                 .unwrap_or_default();
+            if argv.first().map(String::as_str) == Some("status") {
+                return Ok(json!({"text": codex_sub::status::text().await}));
+            }
             manifest::run_command(name, &argv)
                 .ok_or_else(|| ProviderRpcError::Protocol("unknown command".to_string()))
         }

@@ -113,6 +113,7 @@ pub fn command(argv: &[String]) -> String {
 
 const USAGE: &str = "\
 /codex — switch the session to Codex (connect → model picker).
+/codex status — login, plan, and quota windows.
 /codex tools — which harness tools the upstream Codex model may call.
   /codex tools          show the current policy
   /codex tools all      allow every harness tool the host sends
