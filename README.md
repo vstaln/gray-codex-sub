@@ -9,13 +9,47 @@
   <img alt="rust" src="https://img.shields.io/badge/built%20with-rust-orange.svg">
 </p>
 
-`gray-codex-sub` lets gray run turns on your ChatGPT plan instead of an API key. It is a protocol-1.2 provider sidecar: gray owns the agent loop, tools, approvals, and compaction — the plugin only supplies the OAuth login and the provider declaration the host uses for each Responses request.
+`gray-codex-sub` lets gray run turns on your ChatGPT plan instead of an API
+key. It is a protocol-1.2 provider sidecar: gray owns the agent loop, tools,
+approvals, and compaction — the plugin drives pooled `codex app-server`
+children, the Codex CLI's own engine, behind a per-turn loopback relay.
 
-## Auth method
+## Requirements
 
-**ChatGPT login via Codex CLI client (unofficial)** — this plugin signs in with the Codex CLI's own OAuth client and sends requests to `https://chatgpt.com/backend-api/codex`, the same internal backend the Codex CLI uses. It works today, but it is unofficial: OpenAI can change or close that backend at any time, which would break this provider without warning.
+- Codex CLI on `PATH` (>= 0.154), or set
+  `GRAY_CODEX_SUB_COMMAND=/path/to/codex`.
+- Signed in with the CLI against the plugin's Codex home:
 
-> **Planned:** the official **Sign in with ChatGPT** login — OpenAI's supported flow for open-source apps, using ChatGPT plan usage on `https://api.openai.com/v1` — is coming in a later release.
+  ```sh
+  CODEX_HOME=$HOME/.gray/codex-home codex login
+  ```
+
+  Or point `CODEX_HOME` at your existing Codex login (e.g. `~/.codex`).
+
+## What the plugin does and does not do
+
+- **Reads no tokens.** It never opens `$CODEX_HOME/auth.json` (existence
+  check only, for a fast error message) and runs no OAuth flow of its own.
+  `codex login` runs only in your terminal; the CLI owns and rotates its
+  tokens.
+- **Calls no internal endpoints.** Every request — chat, sign-in check,
+  model list, usage — goes through the official `codex app-server`
+  process (`account/read`, `model/list`, `account/rateLimits/read`,
+  `thread/*`, `turn/*`). Nothing is sent to `chatgpt.com/backend-api`.
+- **Sends no spoofed client identity.** The app-server handshake names
+  `gray-codex-sub` as the client. No borrowed client IDs, no
+  `chatgpt-account-id` headers.
+- **Keeps the session locked down.** Threads run `approvalPolicy: never`
+  with a `read-only` sandbox, ephemeral (nothing on disk), in a
+  per-thread temp staging dir. Any other server→client request is
+  refused.
+- **Separate Codex home.** Unless you set `CODEX_HOME`, the plugin uses
+  `~/.gray/codex-home` — its login never rotates or disturbs the one your
+  own `codex` CLI holds in `~/.codex`.
+- **Lists models from the CLI.** `model/list` paged through the
+  app-server; nothing is hardcoded or borrowed.
+- **Reports quota from the CLI.** `account/rateLimits/read` — the same
+  read Codex's own rate-limit view uses.
 
 ## Build & install
 
@@ -25,27 +59,36 @@ cd gray-codex-sub
 cargo build --release
 ```
 
-The binary lands at `./target/release/codex-sub`. Install it on `PATH` as `gray-codex-sub` and register it with gray:
+The binary lands at `./target/release/codex-sub`. Install it on `PATH` as
+`gray-codex-sub` and register it with gray:
 
 ```sh
 cp target/release/codex-sub ~/.local/bin/gray-codex-sub
 gray install plugin codex-sub
 ```
 
-Run the install from an interactive terminal and approve the `provider.credentials` capability.
+Run the install from an interactive terminal and approve the
+`provider.credentials` capability.
 
 ## Connecting
 
-Once registered, run `/connect` in gray, pick **Codex backend (unofficial)**, and complete the browser sign-in. Then choose a model:
+Sign in with the CLI first (see Requirements), then run `/connect` in
+gray, pick **Codex (ChatGPT sign-in via Codex CLI)**, and choose a model:
 
 ```sh
 /model codex-sub/gpt-5.1-codex
 gray --model codex-sub/gpt-5.1-codex -p "Review this codebase"
 ```
 
+`/codex status` shows the CLI's account, plan, and quota windows.
+`/codex tools …` manages the upstream tool allowlist.
+
 ## Usage limits
 
-For ChatGPT Plus users, the five-hour usage limit is **shared across all apps** where you use your ChatGPT plan — usage here counts against the same total as every other app. Track it in [ChatGPT Settings → Usage](https://chatgpt.com/settings/usage).
+For ChatGPT Plus users, the five-hour usage limit is **shared across all
+apps** where you use your ChatGPT plan — usage here counts against the
+same total as every other app. Track it in [ChatGPT Settings →
+Usage](https://chatgpt.com/settings/usage) or `/codex status`.
 
 ## License
 

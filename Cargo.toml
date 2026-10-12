@@ -1,6 +1,6 @@
 [package]
 name = "gray-codex-sub"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
@@ -15,20 +15,12 @@ name = "codex-sub"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0"
-base64 = "0.22"
 gray-core = { git = "https://github.com/vstaln/gray.git" }
 gray-plugin = { git = "https://github.com/vstaln/gray.git" }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
 tempfile = "3"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
-tokio-util = "0.7"
-url = { version = "2", features = ["serde"] }
-uuid = { version = "1", features = ["v4"] }
-zeroize = { version = "1.8", features = ["derive"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

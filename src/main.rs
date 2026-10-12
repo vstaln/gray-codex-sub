@@ -1,8 +1,11 @@
 //! codex-sub: a protocol-1.2 sidecar for Gray.
 //!
-//! Unofficial Codex-backend route: logs in with the Codex CLI's own OAuth
-//! client, then serves chat through pooled `codex app-server` children
-//! (one Codex thread per conversation) behind a per-turn loopback relay.
+//! Codex-backend route through the official Codex CLI: sign-in is the
+//! CLI's own job (`codex login` against the plugin's CODEX_HOME), and
+//! chat runs through pooled `codex app-server` children (one Codex
+//! thread per conversation) behind a per-turn loopback relay. The
+//! sidecar holds no tokens — the app-server authenticates with the
+//! CLI's stored login.
 //!
 //! Startup is deliberately unprivileged: the `manifest` argv shortcut and
 //! the `plugin/manifest` handshake must survive hosts where the tokio
@@ -14,20 +17,18 @@
 //! provider-login shortcut switches the session to Codex; `/codex tools …`
 //! owns the upstream tool allowlist (`{"text": …}`).
 
-use codex_sub::{chat, login, manifest, models, oauth, relay, session, setup, usage};
+use codex_sub::{appserver, chat, manifest, models, relay, session, setup, usage};
 
 use std::io::{BufRead, Write};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
+use gray_core::credential::CredentialMaterial;
 use gray_plugin::{
-    ProviderAuthPoll, ProviderModelsRequest, ProviderRefreshRequest, ProviderRevokeRequest,
-    ProviderRpcError,
+    ProviderAuthPoll, ProviderAuthStart, ProviderModelsRequest, ProviderRefreshRequest,
+    ProviderRevokeRequest, ProviderRpcError, ProviderRpcFailure,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-
-use crate::login::LoginManager;
-use crate::oauth::OAuthConfig;
 
 /// Diagnostics live on stderr only — stdout carries protocol frames.
 fn diag(message: &str) {
@@ -55,8 +56,6 @@ struct Response {
 /// State the request handlers share; built inside `serve` so its pieces
 /// stay plain values (nothing here touches the OS).
 struct Shared {
-    logins: LoginManager,
-    config: OAuthConfig,
     relays: relay::Intents,
 }
 
@@ -94,11 +93,7 @@ fn main() {
     }
 
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("status")) {
-        if let Some(rt) = build_runtime() {
-            println!("{}", rt.block_on(codex_sub::status::text()));
-            return;
-        }
-        println!("Codex backend (unofficial)\n  status: (no tokio runtime)");
+        println!("{}", codex_sub::status::text());
         return;
     }
 
@@ -213,11 +208,8 @@ fn build_runtime() -> Option<tokio::runtime::Runtime> {
 /// (relay, session children) fail closed per call.
 fn serve_serial(runtime: &tokio::runtime::Runtime) {
     let shared = Shared {
-        logins: LoginManager::default(),
-        config: OAuthConfig::default(),
         relays: Default::default(),
     };
-    session::install_oauth(shared.config.clone());
     if let Err(e) = session::start_reaper() {
         diag(&format!(
             "idle-session reaper unavailable ({e}); pooled sessions will not be reaped"
@@ -354,11 +346,8 @@ fn write_response(
 
 async fn serve(mut stdin_rx: tokio::sync::mpsc::UnboundedReceiver<String>) {
     let shared = Arc::new(Shared {
-        logins: LoginManager::default(),
-        config: OAuthConfig::default(),
         relays: Default::default(),
     });
-    session::install_oauth(shared.config.clone());
     if let Err(e) = session::start_reaper() {
         diag(&format!(
             "idle-session reaper unavailable ({e}); pooled sessions will not be reaped"
@@ -418,8 +407,23 @@ async fn handle(shared: &Shared, request: &Request) -> Result<Value, ProviderRpc
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             ensure_provider(provider, auth_method)?;
-            let start = shared.logins.start(&shared.config).await?;
-            Ok(serde_json::to_value(start).unwrap())
+            match blocking(appserver::probe).await? {
+                appserver::Probe::Ready(_) => Ok(serde_json::to_value(ProviderAuthStart {
+                    operation_id: String::new(),
+                    status: "completed".to_string(),
+                    verification_uri: String::new(),
+                    expires_at: now_secs() + 600,
+                    retry_after_ms: 0,
+                })
+                .unwrap()),
+                appserver::Probe::NotInstalled => {
+                    Err(ProviderRpcError::Unavailable(setup::INSTALL_HINT.into()))
+                }
+                appserver::Probe::NotSignedIn(_) => {
+                    Err(ProviderRpcError::Unavailable(setup::LOGIN_HINT.into()))
+                }
+                appserver::Probe::Failed(e) => Err(ProviderRpcError::Unavailable(e)),
+            }
         }
         "provider/auth/poll" => {
             ensure_provider(
@@ -432,101 +436,73 @@ async fn handle(shared: &Shared, request: &Request) -> Result<Value, ProviderRpc
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
             )?;
-            let operation_id = params
-                .get("operation_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let poll = shared.logins.poll(operation_id).await;
-            // A completed login is a credential sighting: mirror it so
-            // `provider/chat` children can authenticate without the
-            // credential ever crossing the wire again.
-            if let ProviderAuthPoll::Completed(ref credential) = poll {
-                setup::observe(credential);
-            }
+            // The probe is synchronous — there is no pending operation.
+            let poll = match blocking(appserver::probe).await? {
+                appserver::Probe::Ready(account) => {
+                    ProviderAuthPoll::Completed(login_material(&account))
+                }
+                appserver::Probe::NotSignedIn(_) => ProviderAuthPoll::Failed(ProviderRpcFailure {
+                    code: "unavailable".to_string(),
+                    message: setup::LOGIN_HINT.into(),
+                    retryable: false,
+                    terminal: true,
+                }),
+                appserver::Probe::NotInstalled => ProviderAuthPoll::Failed(ProviderRpcFailure {
+                    code: "unavailable".to_string(),
+                    message: setup::INSTALL_HINT.into(),
+                    retryable: false,
+                    terminal: true,
+                }),
+                appserver::Probe::Failed(e) => ProviderAuthPoll::Failed(ProviderRpcFailure {
+                    code: "unavailable".to_string(),
+                    message: e,
+                    retryable: true,
+                    terminal: false,
+                }),
+            };
             Ok(poll_value(poll))
         }
-        "provider/auth/cancel" => {
-            let operation_id = params
-                .get("operation_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            shared.logins.cancel(operation_id).await;
-            Ok(json!({}))
-        }
+        "provider/auth/cancel" => Ok(json!({})),
         "provider/auth/refresh" => {
             let request: ProviderRefreshRequest =
                 serde_json::from_value(params).map_err(|_| invalid("provider refresh request"))?;
             ensure_provider(&request.provider, &request.auth_method)?;
-            // Mirror the sighting first: whichever way this grant lands,
-            // the cache learns what the host last handed us.
-            setup::observe(&request.credential.credential);
-            match oauth::refresh_material(&shared.config, &request.credential.credential).await {
-                Ok(material) => {
-                    setup::observe(&material);
-                    Ok(serde_json::to_value(material).unwrap())
+            // "Refresh" re-probes the CLI login: tokens live in the
+            // Codex home, so a fresh marker is all the host needs.
+            match blocking(appserver::probe).await? {
+                appserver::Probe::Ready(account) => {
+                    Ok(serde_json::to_value(login_material(&account)).unwrap())
                 }
-                // A session-driven refresh (the app-server's
-                // `chatgptAuthTokens/refresh` answer) may have rotated the
-                // refresh token past the copy the host is holding: retry
-                // once with the cached token before reporting failure.
-                Err(error) if is_invalid_grant(&error) => {
-                    let cached_rt =
-                        setup::read_cached()
-                            .and_then(|c| c.refresh_token)
-                            .filter(|rt| {
-                                request.credential.credential.secrets.get("refresh_token")
-                                    != Some(rt.as_str())
-                            });
-                    match cached_rt {
-                        Some(rt) => {
-                            let tokens = oauth::refresh_cached(&shared.config, &rt)
-                                .await
-                                .map_err(|_| error)?;
-                            setup::store(&setup::CachedAuth {
-                                access_token: tokens.access_token.clone(),
-                                refresh_token: Some(tokens.refresh_token.clone()),
-                                account_id: Some(tokens.account_id.clone()),
-                                expires_at: Some(tokens.expires_at),
-                                plan_type: tokens.plan_type.clone(),
-                            });
-                            let material = credential_from_tokens(&tokens);
-                            Ok(serde_json::to_value(material).unwrap())
-                        }
-                        None => Err(error),
-                    }
+                appserver::Probe::NotSignedIn(_) => {
+                    Err(ProviderRpcError::Rpc(ProviderRpcFailure {
+                        code: "invalid_grant".to_string(),
+                        message: setup::LOGIN_HINT.into(),
+                        retryable: false,
+                        terminal: true,
+                    }))
                 }
-                Err(error) => Err(error),
+                appserver::Probe::NotInstalled => {
+                    Err(ProviderRpcError::Unavailable(setup::INSTALL_HINT.into()))
+                }
+                appserver::Probe::Failed(e) => Err(ProviderRpcError::Unavailable(e)),
             }
         }
         "provider/auth/revoke" => {
             let request: ProviderRevokeRequest =
                 serde_json::from_value(params).map_err(|_| invalid("provider revoke request"))?;
             ensure_provider(&request.provider, &request.auth_method)?;
-            // The login is gone: drop the mirror so children stop
-            // authenticating with it.
-            setup::clear();
-            Ok(json!({"status": "unsupported"}))
+            // Revoke clears only what this plugin ever wrote: the
+            // retired token mirror. The real login belongs to the CLI —
+            // `codex logout` removes it.
+            let _ = std::fs::remove_file(setup::legacy_auth_file());
+            Ok(json!({"status": "unsupported", "message": REVOKE_MSG}))
         }
-        "provider/usage" => usage::handle().await,
+        "provider/usage" => blocking(usage::handle).await?,
         "provider/models" => {
             let request: ProviderModelsRequest =
                 serde_json::from_value(params).map_err(|_| invalid("provider models request"))?;
             ensure_provider(&request.provider, &request.auth_method)?;
-            let access = request
-                .credential
-                .credential
-                .secrets
-                .get("access_token")
-                .ok_or_else(invalid_auth)?;
-            let account_id = request
-                .credential
-                .credential
-                .metadata
-                .get("account_id")
-                .ok_or_else(invalid_auth)?;
-            let models = models::fetch_models(http()?, access, account_id).await?;
-            // Model fetches carry the credential too: keep the mirror warm.
-            setup::observe(&request.credential.credential);
+            let models = blocking(models::fetch).await??;
             Ok(serde_json::to_value(models).unwrap())
         }
         "provider/chat" => chat_turn(&shared.relays, params).await,
@@ -545,7 +521,7 @@ async fn handle(shared: &Shared, request: &Request) -> Result<Value, ProviderRpc
                 })
                 .unwrap_or_default();
             if argv.first().map(String::as_str) == Some("status") {
-                return Ok(json!({"text": codex_sub::status::text().await}));
+                return Ok(json!({"text": blocking(codex_sub::status::text).await?}));
             }
             manifest::run_command(name, &argv)
                 .ok_or_else(|| ProviderRpcError::Protocol("unknown command".to_string()))
@@ -555,22 +531,6 @@ async fn handle(shared: &Shared, request: &Request) -> Result<Value, ProviderRpc
             "unknown provider method".to_string(),
         )),
     }
-}
-
-/// The OAuth HTTP client is built lazily on first need: a host that can
-/// run threads but can't init TLS still gets the manifest and clean
-/// `unavailable` answers instead of a spawn-time exit.
-fn http() -> Result<&'static reqwest::Client, ProviderRpcError> {
-    static HTTP: OnceLock<Option<reqwest::Client>> = OnceLock::new();
-    HTTP.get_or_init(|| match oauth::http_client() {
-        Ok(client) => Some(client),
-        Err(e) => {
-            diag(&format!("login HTTP client unavailable: {e:#}"));
-            None
-        }
-    })
-    .as_ref()
-    .ok_or_else(|| ProviderRpcError::Unavailable("provider HTTP client unavailable".to_string()))
 }
 
 /// One relayed turn: park the intent, open the loopback relay, and hand
@@ -596,7 +556,7 @@ async fn chat_turn(relays: &relay::Intents, params: Value) -> Result<Value, Prov
     if setup::resolve_command().is_none() {
         return Err(ProviderRpcError::Unavailable(setup::INSTALL_HINT.into()));
     }
-    if setup::read_cached().is_none() {
+    if !setup::cli_login_present() {
         return Err(ProviderRpcError::Unavailable(setup::LOGIN_HINT.into()));
     }
     let bearer = format!("codex-sub-{}", chat::rand_hex(16));
@@ -621,26 +581,50 @@ async fn chat_turn(relays: &relay::Intents, params: Value) -> Result<Value, Prov
     }))
 }
 
-fn is_invalid_grant(error: &ProviderRpcError) -> bool {
-    matches!(error, ProviderRpcError::Rpc(f) if f.code == "invalid_grant")
-}
+/// Codex CLI credentials belong to the Codex CLI; nothing here can
+/// revoke them upstream.
+const REVOKE_MSG: &str = "Codex credentials live in the Codex CLI home (CODEX_HOME). Sign out with \
+    `codex logout`. This plugin stores no credentials to revoke.";
 
-/// CredentialMaterial the host expects from `auth/refresh`, built from a
-/// cache-path token set.
-fn credential_from_tokens(
-    tokens: &oauth::CachedTokenSet,
-) -> gray_core::credential::CredentialMaterial {
-    let mut material = gray_core::credential::CredentialMaterial::default();
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+/// Run a blocking probe off the async workers — the probe itself spawns
+/// a short-lived `codex app-server` child.
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, ProviderRpcError> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| ProviderRpcError::Unavailable(format!("probe task failed: {e}")))
+}
+/// The marker handed to the host on a completed sign-in: the real login
+/// is the Codex CLI's own `auth.json` under CODEX_HOME — never proxied
+/// and never read by this plugin. The marker only records that a
+/// signed-in CLI was observed.
+fn login_material(account: &Value) -> CredentialMaterial {
+    let mut material = CredentialMaterial::default();
     material
         .secrets
-        .insert("access_token", tokens.access_token.clone());
-    material
-        .secrets
-        .insert("refresh_token", tokens.refresh_token.clone());
-    material
-        .metadata
-        .insert("account_id".to_string(), tokens.account_id.clone());
-    material.expires_at = Some(tokens.expires_at);
+        .insert("codex_cli_login".to_string(), "1".to_string());
+    if let Some(v) = setup::cli_version() {
+        material.metadata.insert("cli_version".to_string(), v);
+    }
+    let acct = account.get("account").cloned().unwrap_or(Value::Null);
+    if let Some(email) = acct.get("email").and_then(Value::as_str) {
+        material
+            .metadata
+            .insert("account".to_string(), email.to_string());
+    }
+    if let Some(plan) = acct.get("planType").and_then(Value::as_str) {
+        material
+            .metadata
+            .insert("plan".to_string(), plan.to_string());
+    }
+    material.expires_at = None;
     material
 }
 
@@ -652,10 +636,6 @@ fn ensure_provider(provider: &str, auth_method: &str) -> Result<(), ProviderRpcE
             "unknown provider or auth method".to_string(),
         ))
     }
-}
-
-fn invalid_auth() -> ProviderRpcError {
-    ProviderRpcError::Protocol("provider credential is incomplete".to_string())
 }
 
 fn invalid(message: &'static str) -> ProviderRpcError {

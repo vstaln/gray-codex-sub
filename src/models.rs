@@ -1,120 +1,89 @@
-//! Bounded Codex model discovery.
-
-use std::time::Duration;
-
-use gray_plugin::{ProviderModel, ProviderModelCatalog, ProviderRpcError, ProviderRpcFailure};
-
-/// The Codex CLI's own model-catalog endpoint. Model *ids* are never
-/// pinned (the answer is enumerated), and the endpoint itself is
-/// env-overridable for when it moves.
-const MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
-const MODELS_URL_ENV: &str = "GRAY_CODEX_SUB_MODELS_URL";
-
-fn models_url() -> String {
-    std::env::var(MODELS_URL_ENV)
-        .ok()
-        .filter(|u| !u.trim().is_empty())
-        .unwrap_or_else(|| MODELS_URL.to_string())
-}
+//! Model catalog from `codex app-server`'s `model/list`: the CLI's own
+//! view of what the signed-in account may run. No list is hardcoded and
+//! no borrowed token is sent — the app-server authenticates with the
+//! CLI's stored login.
+use crate::appserver;
+use gray_plugin::{ProviderModel, ProviderModelCatalog, ProviderRpcError};
+use serde_json::{Value, json};
+/// Discovery is bounded: more rows than this means something is wrong.
 const MAX_MODELS: usize = 128;
-const MAX_BODY_BYTES: usize = 192 * 1024;
-
+const PAGE_SIZE: u32 = 64;
 #[path = "models_tests.rs"]
 #[cfg(test)]
 mod tests;
-
-fn unreachable() -> ProviderRpcError {
-    ProviderRpcError::Rpc(ProviderRpcFailure {
-        code: "unavailable".to_string(),
-        message: "model discovery unavailable".to_string(),
-        retryable: false,
-        terminal: false,
-    })
+fn unavailable(message: impl Into<String>) -> ProviderRpcError {
+    ProviderRpcError::Unavailable(message.into())
 }
-
-pub async fn fetch_models(
-    client: &reqwest::Client,
-    access_token: &str,
-    account_id: &str,
-) -> Result<ProviderModelCatalog, ProviderRpcError> {
-    let response = client
-        .get(models_url())
-        .bearer_auth(access_token)
-        .header("chatgpt-account-id", account_id)
-        .header("originator", "gray")
-        .header("OpenAI-Beta", "responses=experimental")
-        .header("Accept", "application/json")
-        .timeout(Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(|_| unreachable())?;
-    if response.status().is_redirection() {
-        return Err(unreachable());
-    }
-    if !response.status().is_success() {
-        return Err(unreachable());
-    }
-    let mut body = Vec::new();
-    let mut response = response;
-    while let Some(chunk) = response.chunk().await.map_err(|_| unreachable())? {
-        body.extend_from_slice(&chunk);
-        if body.len() > MAX_BODY_BYTES {
-            return Err(unreachable());
-        }
-    }
-    parse_models(&body)
-}
-
-pub fn parse_models(body: &[u8]) -> Result<ProviderModelCatalog, ProviderRpcError> {
-    let value: serde_json::Value = serde_json::from_slice(body).map_err(|_| unreachable())?;
-    let mut models: Vec<ProviderModel> = Vec::new();
-    if let Some(list) = value.get("models").and_then(|value| value.as_array()) {
-        for item in list.iter().take(MAX_MODELS) {
-            let visible =
-                item.get("visibility").and_then(serde_json::Value::as_str) == Some("list");
-            let supported = item
-                .get("supported_in_api")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            if !visible || !supported {
-                continue;
+/// One catalog fetch: paged `model/list` over a single probe client.
+pub fn fetch() -> Result<ProviderModelCatalog, ProviderRpcError> {
+    let mut models = Vec::new();
+    appserver::with_client(|client| {
+        let mut cursor = Value::Null;
+        loop {
+            let resp = client.call(
+                "model/list",
+                json!({
+                    "cursor": cursor,
+                    "limit": PAGE_SIZE,
+                    "includeHidden": false,
+                }),
+            )?;
+            if let Some(data) = resp.get("data").and_then(Value::as_array) {
+                for item in data {
+                    if let Some(row) = model_row(item) {
+                        models.push(row);
+                        if models.len() >= MAX_MODELS {
+                            return Ok(());
+                        }
+                    }
+                }
             }
-            let Some(id) = item.get("id").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let model = ProviderModel {
-                id: id.to_string(),
-                name: item
-                    .get("display_name")
-                    .and_then(serde_json::Value::as_str)
-                    .or_else(|| item.get("name").and_then(serde_json::Value::as_str))
-                    .unwrap_or(id)
-                    .to_string(),
-                context_window: Some(
-                    item.get("context_window")
-                        .and_then(serde_json::Value::as_u64)
-                        .map(|value| value as u32)
-                        .unwrap_or(0),
-                ),
-                reasoning_efforts: item
-                    .get("reasoning_efforts")
-                    .and_then(serde_json::Value::as_array)
-                    .map(|values| {
-                        values
-                            .iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .map(str::to_string)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                // No effort-mapped variants or composite slots.
-                variants: vec![],
-                slots: vec![],
-            };
-            models.push(model);
+            match resp.get("nextCursor") {
+                Some(c) if !c.is_null() => cursor = c.clone(),
+                _ => return Ok(()),
+            }
         }
+    })
+    .map_err(ProviderRpcError::from)?;
+    if models.is_empty() {
+        return Err(unavailable("codex app-server reported no models"));
     }
     models.sort_by(|left, right| left.id.cmp(&right.id));
     models.dedup_by(|left, right| left.id == right.id);
     Ok(ProviderModelCatalog { models })
+}
+/// Map one `Model` (v2 app-server schema): `model` is the slug
+/// `thread/start` accepts, `displayName` the picker label. `hidden`
+/// rows are server-flagged picker exclusions — skipped even when the
+/// page asks for them. The schema carries no context-window field.
+fn model_row(v: &Value) -> Option<ProviderModel> {
+    if v.get("hidden").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let slug = v.get("model").and_then(Value::as_str)?.to_string();
+    Some(ProviderModel {
+        id: slug.clone(),
+        name: v
+            .get("displayName")
+            .and_then(Value::as_str)
+            .unwrap_or(&slug)
+            .to_string(),
+        context_window: None,
+        reasoning_efforts: v
+            .get("supportedReasoningEfforts")
+            .and_then(Value::as_array)
+            .map(|options| {
+                options
+                    .iter()
+                    .filter_map(|o| {
+                        o.get("reasoningEffort")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        variants: vec![],
+        slots: vec![],
+    })
 }

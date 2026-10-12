@@ -1,37 +1,9 @@
-//! `/codex status` — one glanceable panel: mirrored login, plan, quota
-//! windows. Same convention `nous-sub status` set: key / acct / plan /
-//! windows. Renders `usage::handle()`'s ProviderUsageLimits, so the panel
-//! and the host's `/usage` view can never disagree.
-
-use serde_json::Value;
-
-use crate::{setup, usage};
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn fmt_left(expires_at: Option<u64>) -> String {
-    let Some(exp) = expires_at else {
-        return String::new();
-    };
-    let now = now_secs() as i64;
-    let left = exp as i64 - now;
-    let t = if left <= 0 {
-        "expired".to_string()
-    } else if left < 90 {
-        format!("{left}s left")
-    } else if left < 5400 {
-        format!("{}m left", left / 60)
-    } else {
-        format!("{}h{}m left", left / 3600, left % 3600 / 60)
-    };
-    format!(" · {t}")
-}
-
+//! `/codex status` — one glanceable panel: CLI presence, who is signed
+//! in, plan, quota windows. Same convention `nous-sub status` set:
+//! key / acct / plan / windows. Renders the same card `usage::handle()`
+//! returns, so the panel and the host's `/usage` view never disagree.
+use crate::{appserver, setup, usage};
+use serde_json::{Value, json};
 fn window_line(w: &Value) -> Option<String> {
     let label = w.get("label")?.as_str()?;
     let mut line = format!("  {label}:");
@@ -43,42 +15,66 @@ fn window_line(w: &Value) -> Option<String> {
     }
     Some(line)
 }
-
-pub async fn text() -> String {
-    let mut out = "Codex backend (unofficial)".to_string();
-    let auth = setup::read_cached();
-    match &auth {
-        None => out.push_str("\n  login: none — /connect → Codex → codex-login"),
-        Some(a) => {
-            out.push_str(&format!(
-                "\n  login: gray-auth.json (oauth){}",
-                fmt_left(a.expires_at)
-            ));
-            if let Some(id) = a.account_id.as_deref() {
-                out.push_str(&format!("\n  acct:  chatgpt {}…", &id[..id.len().min(8)]));
+fn account_line(account: &Value) -> String {
+    match account.get("account") {
+        Some(a) if !a.is_null() => match a.get("type").and_then(Value::as_str) {
+            Some("chatgpt") => {
+                let email = a.get("email").and_then(Value::as_str).unwrap_or("?");
+                let plan = a.get("planType").and_then(Value::as_str).unwrap_or("?");
+                format!("chatgpt {email} · plan {plan}")
+            }
+            Some("apiKey") => "api key".to_string(),
+            Some(other) => other.to_string(),
+            None => "signed in".to_string(),
+        },
+        _ => "none — run `codex login`".to_string(),
+    }
+}
+pub fn text() -> String {
+    let mut out = "Codex (ChatGPT subscription via Codex CLI)".to_string();
+    let probed = appserver::with_client(|c| {
+        let account = c.call("account/read", json!({}))?;
+        // A failed usage read must not kill the status panel.
+        let limits = c
+            .call("account/rateLimits/read", json!({}))
+            .unwrap_or(Value::Null);
+        Ok((account, limits))
+    });
+    match &probed {
+        Err(appserver::Error::NotInstalled) => {
+            out.push_str(&format!("\n  cli:   {}", setup::INSTALL_HINT));
+        }
+        Err(e) => out.push_str(&format!("\n  probe: {e}")),
+        Ok((account, limits)) => {
+            let signed_in = account.get("account").is_some_and(|a| !a.is_null());
+            out.push_str(&format!("\n  login: {}", account_line(account)));
+            if signed_in {
+                let card = usage::card(account, limits);
+                if let Some(plan) = card.get("plan").and_then(Value::as_str) {
+                    out.push_str(&format!("\n  plan:  {plan}"));
+                }
+                if let Some(wins) = card.get("windows").and_then(Value::as_array) {
+                    for w in wins {
+                        if let Some(line) = window_line(w) {
+                            out.push('\n');
+                            out.push_str(&line);
+                        }
+                    }
+                }
+                if let Some(note) = card.get("note").and_then(Value::as_str)
+                    && !note.is_empty()
+                {
+                    out.push_str(&format!("\n  note:  {note}"));
+                }
             }
         }
     }
-    match usage::handle().await {
-        Ok(v) => {
-            if let Some(plan) = v.get("plan").and_then(Value::as_str) {
-                out.push_str(&format!("\n  plan:  {plan}"));
-            }
-            if let Some(wins) = v.get("windows").and_then(Value::as_array) {
-                for w in wins {
-                    if let Some(line) = window_line(w) {
-                        out.push('\n');
-                        out.push_str(&line);
-                    }
-                }
-            }
-            if let Some(note) = v.get("note").and_then(Value::as_str)
-                && !note.is_empty()
-            {
-                out.push_str(&format!("\n  note:  {note}"));
-            }
-        }
-        Err(e) => out.push_str(&format!("\n  usage: ({e})")),
+    out.push_str(&format!("\n  home:  {}", setup::codex_home().display()));
+    if setup::legacy_auth_file().is_file() {
+        out.push_str(
+            "\n  note:  retired credential mirror gray-auth.json still on disk — \
+             revoke or delete it to clear",
+        );
     }
     out
 }

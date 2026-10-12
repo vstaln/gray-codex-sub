@@ -1,18 +1,36 @@
 use super::*;
 
 #[test]
-fn model_parser_filters_private_and_unsupported_entries() {
-    let body = br#"{"models":[
-        {"id":"private","display_name":"Private","visibility":"private","supported_in_api":true},
-        {"id":"unsupported","display_name":"Unsupported","visibility":"list","supported_in_api":false},
-        {"id":"gpt-test","display_name":"GPT Test","visibility":"list","supported_in_api":true,"context_window":128000,"reasoning_efforts":["low","high"]}
-    ]}"#;
-    let catalog = parse_models(body).unwrap();
-    assert_eq!(catalog.models.len(), 1);
-    assert_eq!(catalog.models[0].id, "gpt-test");
-    assert_eq!(catalog.models[0].context_window, Some(128000));
+fn model_row_maps_schema_fields_and_skips_hidden() {
+    let hidden = serde_json::json!({
+        "id": "m0", "model": "m0", "displayName": "M0", "hidden": true,
+        "isDefault": false, "description": "", "defaultReasoningEffort": "low",
+        "supportedReasoningEfforts": [],
+    });
+    assert!(model_row(&hidden).is_none());
+    let row = model_row(&serde_json::json!({
+        "id": "m1", "model": "gpt-fake", "displayName": "GPT Fake",
+        "hidden": false, "isDefault": true, "description": "x",
+        "defaultReasoningEffort": "medium",
+        "supportedReasoningEfforts": [
+            {"description": "d", "reasoningEffort": "low"},
+            {"description": "d2", "reasoningEffort": "high"},
+        ],
+    }))
+    .expect("visible row");
+    assert_eq!(row.id, "gpt-fake");
+    assert_eq!(row.name, "GPT Fake");
+    assert_eq!(row.context_window, None);
     assert_eq!(
-        catalog.models[0].reasoning_efforts,
+        row.reasoning_efforts,
         vec!["low".to_string(), "high".to_string()]
     );
+    // The slug, not the opaque `id`, is what thread/start takes.
+    let slug_named = model_row(&serde_json::json!({
+        "id": "opaque", "model": "wire-slug", "displayName": "N",
+        "hidden": false, "isDefault": false, "description": "",
+        "defaultReasoningEffort": "low", "supportedReasoningEfforts": [],
+    }))
+    .expect("slug row");
+    assert_eq!(slug_named.id, "wire-slug");
 }

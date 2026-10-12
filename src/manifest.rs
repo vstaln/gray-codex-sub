@@ -16,7 +16,9 @@ pub const CODEX_COMMAND: &str = "/codex";
 
 /// A protocol-1.2 manifest value. Gray validates every provider and
 /// malformed peers independently; this plugin ships exactly one valid
-/// provider with the reference request policy.
+/// provider with the reference request policy. The auth method keeps
+/// kind `oauth`: the sign-in is an external (CLI-run) OAuth flow the
+/// host treats the same way.
 pub fn manifest() -> gray_plugin::Manifest {
     gray_plugin::Manifest {
         name: PLUGIN_NAME.to_string(),
@@ -54,12 +56,13 @@ pub fn run_command(name: &str, argv: &[String]) -> Option<serde_json::Value> {
 /// opens per turn (see `provider/chat`); the relay drives a pooled
 /// `codex app-server` child that holds the real ChatGPT session. The
 /// bearer is a per-turn relay token minted by the sidecar, never the
-/// user's OAuth credential. The base URL is a placeholder — the real
-/// per-turn URL comes back in `provider/chat`'s `relay_url`.
+/// user's credential — that stays inside the Codex CLI's own home. The
+/// base URL is a placeholder — the real per-turn URL comes back in
+/// `provider/chat`'s `relay_url`.
 pub fn provider() -> ProviderDecl {
     ProviderDecl {
         id: PROVIDER_ID.to_string(),
-        name: "Codex backend (unofficial)".to_string(),
+        name: "Codex (ChatGPT sign-in via Codex CLI)".to_string(),
         transport: ProviderTransportDecl {
             kind: "openai-responses".to_string(),
             base_url: "https://127.0.0.1:1/"
@@ -98,7 +101,7 @@ pub fn provider() -> ProviderDecl {
         },
         auth_methods: vec![AuthMethodDecl {
             id: AUTH_METHOD_ID.to_string(),
-            name: "ChatGPT login via Codex CLI client (unofficial)".to_string(),
+            name: "ChatGPT sign-in via `codex login`".to_string(),
             kind: "oauth".to_string(),
             operations: vec![
                 "login".to_string(),

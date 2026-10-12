@@ -2,12 +2,13 @@
 //! one Codex thread inside it, reused across turns.
 //!
 //! Wire: JSON-RPC over NDJSON stdio. Client→server: `initialize`,
-//! `initialized`, `account/login/start` (`chatgptAuthTokens`),
-//! `thread/start`, `thread/inject_items`, `turn/start`, `turn/interrupt`.
+//! `initialized`, `account/read` (the login gate), `thread/start`,
+//! `thread/inject_items`, `turn/start`, `turn/interrupt`.
 //! Server→client: notifications (`item/*`, `turn/*`, `thread/*`) plus
 //! *requests* — `item/tool/call` (parked until the host answers through
-//! the next relay turn) and `account/chatgptAuthTokens/refresh` (answered
-//! from the credential cache, refreshing via OAuth first when stale).
+//! the next relay turn). Anything else is refused: the child
+//! authenticates with the CLI's own stored login, so no token is ever
+//! handed to or refreshed through this sidecar.
 //!
 //! Pooling mirrors the Devin sidecar: strict continuation matching (an
 //! incoming history must equal what this session last absorbed plus the
@@ -20,13 +21,12 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use crate::chat::{self, OutItem, PreparedTurn, TurnResult, Usage};
-use crate::oauth::{self, OAuthConfig};
 use crate::setup;
 
 /// Pooled children per sidecar process.
@@ -49,21 +49,6 @@ const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
 /// stderr is captured for diagnostics only; never logged (it can carry
 /// upstream detail we don't want in trace files).
 const STDERR_RING: usize = 40;
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// The OAuth config is installed once at startup; session threads answer
-/// app-server token refreshes without going back through the host.
-static OAUTH: OnceLock<OAuthConfig> = OnceLock::new();
-
-pub fn install_oauth(config: OAuthConfig) {
-    let _ = OAUTH.set(config);
-}
 
 enum Wire {
     Msg(Value),
@@ -130,7 +115,7 @@ pub struct LiveSession {
     last_used: Instant,
     last_prompt_at: Instant,
     /// The claiming turn's disconnect flag — stored so nested handling
-    /// (auth refresh, interrupt) can observe it.
+    /// (interrupt) can observe it.
     cancel: Arc<AtomicBool>,
     closed: bool,
 }
@@ -262,7 +247,7 @@ pub fn shutdown_all() {
     }
 }
 
-/// Spawn + initialize + external-auth login + `thread/start`. The
+/// Spawn + initialize + `account/read` login gate + `thread/start`. The
 /// returned session has an open thread and no absorbed history yet —
 /// `drive_fresh` injects and starts the first turn.
 pub fn spawn(
@@ -273,25 +258,6 @@ pub fn spawn(
     let bin = setup::resolve_command().ok_or_else(|| setup::INSTALL_HINT.to_string())?;
     let home = setup::codex_home();
     std::fs::create_dir_all(&home).map_err(|e| format!("codex home: {e}"))?;
-    let mut auth = setup::read_cached().ok_or_else(|| setup::LOGIN_HINT.to_string())?;
-    // A stale access token fails `account/login/start` outright — refresh
-    // first when we still hold a usable refresh token. A failed refresh
-    // is non-fatal here: the token may carry slack we can't see, and the
-    // login call is the authority.
-    if !auth.access_fresh(now_secs(), 30)
-        && let Some(rt) = auth.refresh_token.clone()
-        && let Some(cfg) = OAUTH.get()
-        && let Ok(t) = oauth::refresh_cached_blocking(cfg, &rt)
-    {
-        auth = setup::CachedAuth {
-            access_token: t.access_token,
-            refresh_token: Some(t.refresh_token),
-            account_id: Some(t.account_id),
-            expires_at: Some(t.expires_at),
-            plan_type: t.plan_type,
-        };
-        setup::store(&auth);
-    }
     let stage = tempfile::Builder::new()
         .prefix("codex-sub-")
         .tempdir()
@@ -407,7 +373,7 @@ pub fn spawn(
         closed: false,
     };
 
-    s.handshake(turn, deadline, &auth)?;
+    s.handshake(turn, deadline)?;
     Ok(s)
 }
 
@@ -470,7 +436,7 @@ impl LiveSession {
     }
 
     /// Handle one inbound server request during any wait. `item/tool/call`
-    /// is parked; auth refresh is serviced; everything else gets a
+    /// is parked; everything else gets a
     /// JSON-RPC error so Codex never hangs on us.
     fn on_server_request(&mut self, id: Value, method: &str, params: &Value) {
         match method {
@@ -500,16 +466,6 @@ impl LiveSession {
                     call_id,
                 });
             }
-            "account/chatgptAuthTokens/refresh" => match self.auth_answer() {
-                Some(result) => {
-                    let _ = self.send(&json!({"id": id, "result": result}));
-                }
-                None => {
-                    let _ = self.send(&json!({"id": id,
-                            "error": {"code": -32000,
-                                "message": "no usable credential cached; re-run /connect codex"}}));
-                }
-            },
             _ => {
                 let _ = self.send(&json!({
                     "id": id,
@@ -517,35 +473,6 @@ impl LiveSession {
                 }));
             }
         }
-    }
-
-    /// Answer `account/chatgptAuthTokens/refresh` from the mirrored
-    /// credential, refreshing through the token endpoint when the access
-    /// token is past (or near) its expiry. Never logs token material.
-    fn auth_answer(&self) -> Option<Value> {
-        let mut auth = setup::read_cached()?;
-        if !auth.access_fresh(now_secs(), 120)
-            && let Some(rt) = auth.refresh_token.clone()
-            && let Some(cfg) = OAUTH.get()
-            && let Ok(tokens) = oauth::refresh_cached_blocking(cfg, &rt)
-        {
-            auth = setup::CachedAuth {
-                access_token: tokens.access_token,
-                refresh_token: Some(tokens.refresh_token),
-                account_id: Some(tokens.account_id),
-                expires_at: Some(tokens.expires_at),
-                plan_type: tokens.plan_type,
-            };
-            setup::store(&auth);
-        }
-        // `chatgptAccountId` is a required string in the response schema;
-        // a cache without one can't authenticate the child.
-        let account_id = auth.account_id?;
-        Some(json!({
-            "accessToken": auth.access_token,
-            "chatgptAccountId": account_id,
-            "chatgptPlanType": auth.plan_type,
-        }))
     }
 
     fn on_notification(&mut self, method: &str, params: &Value) {
@@ -927,13 +854,8 @@ impl LiveSession {
         }
     }
 
-    /// initialize → initialized → external login → thread/start.
-    fn handshake(
-        &mut self,
-        turn: &PreparedTurn,
-        deadline: Instant,
-        auth: &setup::CachedAuth,
-    ) -> Result<(), String> {
+    /// initialize → initialized → `account/read` gate → thread/start.
+    fn handshake(&mut self, turn: &PreparedTurn, deadline: Instant) -> Result<(), String> {
         let init_deadline = deadline.min(Instant::now() + CALL_TIMEOUT);
         self.call(
             "initialize",
@@ -945,18 +867,15 @@ impl LiveSession {
             init_deadline,
         )?;
         self.send(&json!({"method": "initialized", "params": {}}))?;
-        let mut login = json!({
-            "type": "chatgptAuthTokens",
-            "accessToken": auth.access_token,
-        });
-        if let Some(a) = &auth.account_id {
-            login["chatgptAccountId"] = json!(a);
+        // Auth is the CLI's own stored login ($CODEX_HOME/auth.json) —
+        // verified, never read or injected, by this sidecar. `account`
+        // null means this Codex home has no usable login.
+        let acct = self
+            .call("account/read", json!({}), init_deadline)
+            .map_err(|e| format!("account/read: {e}"))?;
+        if acct.get("account").is_none_or(Value::is_null) {
+            return Err(setup::LOGIN_HINT.to_string());
         }
-        if let Some(p) = &auth.plan_type {
-            login["chatgptPlanType"] = json!(p);
-        }
-        self.call("account/login/start", login, init_deadline)
-            .map_err(|e| format!("external auth failed (re-run /connect codex?): {e}"))?;
         let mut params = json!({
             "cwd": self._stage.path().to_string_lossy(),
             // Codex's own tools may never ask (there is no human) and may
@@ -1198,8 +1117,9 @@ fn sweep() {
         }
         // Suspended sessions are mid-turn forever by design: the keepalive
         // path doesn't apply, only the idle timeout above.
-        let due =
-            !s.suspended && !s.prompt_in_flight && now.duration_since(s.last_used) > KEEPALIVE_AFTER;
+        let due = !s.suspended
+            && !s.prompt_in_flight
+            && now.duration_since(s.last_used) > KEEPALIVE_AFTER;
         let newest = due
             && !pool.iter().any(|o| {
                 !o.closed
