@@ -548,18 +548,31 @@ pub fn run_turn(
 ) -> Result<TurnResult, String> {
     let deadline = Instant::now() + timeout;
     let (claimed, reason) = session::take(turn, cancel);
+    // Pool miss: a persisted record may still resume this conversation's
+    // thread as a strict continuation (post-restart, or an overflowed
+    // pool) before the cold-spawn path replays history.
+    let claimed = claimed.or_else(|| session::claim_record(turn, deadline, cancel));
     match claimed {
         Some((mut s, claim)) => {
             let mode = format!("reuse:{}", claim.kind());
             match s.drive(claim, deadline, cancel) {
                 Ok(r) => {
                     s.absorb(turn, &r);
+                    session::save_record(turn, &s);
                     trace_turn(&mode, &s.debug_label(), turn.input.len(), Some(&r), None);
                     session::give_back(s);
                     Ok(r)
                 }
                 Err(e) => {
                     trace_turn(&mode, &s.debug_label(), turn.input.len(), None, Some(&e));
+                    if s.rewarmed {
+                        // First drain on a resumed child proves the
+                        // record: a dead wire here means a stale record,
+                        // not a turn failure — the request is still
+                        // answerable fresh.
+                        s.close();
+                        return fresh_turn(turn, "rewarm_dead", deadline, cancel);
+                    }
                     if s.prompt_in_flight {
                         s.close();
                     } else {
@@ -569,43 +582,54 @@ pub fn run_turn(
                 }
             }
         }
-        None => {
-            let mut s = match session::spawn(turn, deadline, cancel) {
-                Ok(s) => s,
-                Err(e) => {
-                    trace_turn(
-                        &format!("fresh:{reason}"),
-                        "-",
-                        turn.input.len(),
-                        None,
-                        Some(&e),
-                    );
-                    return Err(e);
-                }
-            };
-            let mode = format!("fresh:{reason}");
-            match s.drive_fresh(turn, deadline, cancel) {
-                Ok(r) => {
-                    s.absorb(turn, &r);
-                    trace_turn(&mode, &s.debug_label(), turn.input.len(), Some(&r), None);
-                    session::give_back(s);
-                    Ok(r)
-                }
-                Err(e) => {
-                    trace_turn(&mode, &s.debug_label(), turn.input.len(), None, Some(&e));
-                    if s.prompt_in_flight {
-                        s.close();
-                    } else {
-                        // The failed turn settled upstream: absorb the
-                        // input so a later request can continue this
-                        // thread — and no other conversation can claim a
-                        // child already holding this transcript.
-                        s.absorb_failed(turn);
-                        session::give_back(s);
-                    }
-                    Err(e)
-                }
+        None => fresh_turn(turn, reason, deadline, cancel),
+    }
+}
+
+/// Cold start: spawn a fresh `codex app-server` child and drive the
+/// full history into it. `reason` is the pool-miss (or dead-resume) tag
+/// for the `fresh:*` trace label.
+fn fresh_turn(
+    turn: &PreparedTurn,
+    reason: &str,
+    deadline: Instant,
+    cancel: &Arc<AtomicBool>,
+) -> Result<TurnResult, String> {
+    let mut s = match session::spawn(turn, deadline, cancel) {
+        Ok(s) => s,
+        Err(e) => {
+            trace_turn(
+                &format!("fresh:{reason}"),
+                "-",
+                turn.input.len(),
+                None,
+                Some(&e),
+            );
+            return Err(e);
+        }
+    };
+    let mode = format!("fresh:{reason}");
+    match s.drive_fresh(turn, deadline, cancel) {
+        Ok(r) => {
+            s.absorb(turn, &r);
+            session::save_record(turn, &s);
+            trace_turn(&mode, &s.debug_label(), turn.input.len(), Some(&r), None);
+            session::give_back(s);
+            Ok(r)
+        }
+        Err(e) => {
+            trace_turn(&mode, &s.debug_label(), turn.input.len(), None, Some(&e));
+            if s.prompt_in_flight {
+                s.close();
+            } else {
+                // The failed turn settled upstream: absorb the
+                // input so a later request can continue this
+                // thread — and no other conversation can claim a
+                // child already holding this transcript.
+                s.absorb_failed(turn);
+                session::give_back(s);
             }
+            Err(e)
         }
     }
 }
