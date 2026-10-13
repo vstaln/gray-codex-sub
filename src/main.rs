@@ -215,6 +215,11 @@ fn serve_serial(runtime: &tokio::runtime::Runtime) {
             "idle-session reaper unavailable ({e}); pooled sessions will not be reaped"
         ));
     }
+    // Re-pool sessions persisted before a restart so their upstream
+    // cache entries renew instead of lapsing — best-effort, background.
+    let _ = std::thread::Builder::new()
+        .name("codex-sub-rewarm".into())
+        .spawn(session::rewarm);
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -353,6 +358,11 @@ async fn serve(mut stdin_rx: tokio::sync::mpsc::UnboundedReceiver<String>) {
             "idle-session reaper unavailable ({e}); pooled sessions will not be reaped"
         ));
     }
+    // Re-pool sessions persisted before a restart so their upstream
+    // cache entries renew instead of lapsing — best-effort, background.
+    let _ = std::thread::Builder::new()
+        .name("codex-sub-rewarm".into())
+        .spawn(session::rewarm);
     let mut stdout = std::io::stdout();
     while let Some(line) = stdin_rx.recv().await {
         if line.trim().is_empty() {
