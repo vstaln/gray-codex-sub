@@ -495,8 +495,9 @@ async fn handle(shared: &Shared, request: &Request) -> Result<Value, ProviderRpc
         }
         "provider/auth/cancel" => Ok(json!({})),
         "provider/auth/refresh" => {
-            let request: ProviderRefreshRequest =
-                serde_json::from_value(params).map_err(|_| invalid("provider refresh request"))?;
+            let request: ProviderRefreshRequest = serde_json::from_value(params).map_err(|e| {
+                ProviderRpcError::Protocol(format!("bad provider/auth/refresh params: {e}"))
+            })?;
             ensure_provider(&request.provider, &request.auth_method)?;
             // "Refresh" re-probes the CLI login: tokens live in the
             // Codex home, so a fresh marker is all the host needs.
@@ -519,8 +520,9 @@ async fn handle(shared: &Shared, request: &Request) -> Result<Value, ProviderRpc
             }
         }
         "provider/auth/revoke" => {
-            let request: ProviderRevokeRequest =
-                serde_json::from_value(params).map_err(|_| invalid("provider revoke request"))?;
+            let request: ProviderRevokeRequest = serde_json::from_value(params).map_err(|e| {
+                ProviderRpcError::Protocol(format!("bad provider/auth/revoke params: {e}"))
+            })?;
             ensure_provider(&request.provider, &request.auth_method)?;
             // Revoke clears only what this plugin ever wrote: the
             // retired token mirror. The real login belongs to the CLI —
@@ -530,8 +532,9 @@ async fn handle(shared: &Shared, request: &Request) -> Result<Value, ProviderRpc
         }
         "provider/usage" => blocking(usage::handle).await?,
         "provider/models" => {
-            let request: ProviderModelsRequest =
-                serde_json::from_value(params).map_err(|_| invalid("provider models request"))?;
+            let request: ProviderModelsRequest = serde_json::from_value(params).map_err(|e| {
+                ProviderRpcError::Protocol(format!("bad provider/models params: {e}"))
+            })?;
             ensure_provider(&request.provider, &request.auth_method)?;
             let models = blocking(models::fetch).await??;
             Ok(serde_json::to_value(models).unwrap())
@@ -555,12 +558,12 @@ async fn handle(shared: &Shared, request: &Request) -> Result<Value, ProviderRpc
                 return Ok(json!({"text": blocking(codex_sub::status::text).await?}));
             }
             manifest::run_command(name, &argv)
-                .ok_or_else(|| ProviderRpcError::Protocol("unknown command".to_string()))
+                .ok_or_else(|| ProviderRpcError::Protocol(format!("unknown command: {name}")))
         }
         "plugin/shutdown" => Ok(json!({})),
-        _ => Err(ProviderRpcError::Protocol(
-            "unknown provider method".to_string(),
-        )),
+        other => Err(ProviderRpcError::Protocol(format!(
+            "method not found: {other}"
+        ))),
     }
 }
 
@@ -667,10 +670,6 @@ fn ensure_provider(provider: &str, auth_method: &str) -> Result<(), ProviderRpcE
             "unknown provider or auth method".to_string(),
         ))
     }
-}
-
-fn invalid(message: &'static str) -> ProviderRpcError {
-    ProviderRpcError::Protocol(message.to_string())
 }
 
 fn poll_value(poll: ProviderAuthPoll) -> Value {
