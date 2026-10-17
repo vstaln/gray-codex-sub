@@ -59,42 +59,63 @@ struct Shared {
     relays: relay::Intents,
 }
 
+fn cli_help() -> String {
+    "codex-sub — ChatGPT/Codex subscription provider for gray\n\
+     usage: codex-sub manifest | sidecar | status | tools [all|bash|+name|-name|name …]\n\
+     slash:  /codex · /codex status · /codex tools …"
+        .to_string()
+}
+
 fn main() {
     // `gray plugin add` and registration probe `<bin> manifest`. This path
     // builds no runtime, spawns no threads, and touches no directories —
     // a host under resource limits still has to see the manifest.
     // (args_os: a non-UTF8 argv must not panic us.)
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("manifest")) {
-        // Serialize through to_value exactly like the wire `result` field
-        // so `codex-sub manifest` is byte-identical to `plugin/manifest`.
-        let out = serde_json::to_value(manifest::manifest())
-            .map(|v| v.to_string())
-            .unwrap_or_else(|_| "{}".to_string());
-        let mut stdout = std::io::stdout().lock();
-        if writeln!(stdout, "{out}")
-            .and_then(|()| stdout.flush())
-            .is_err()
-        {
-            diag("manifest write failed: stdout closed");
+    match std::env::args_os().nth(1).as_deref() {
+        Some(m) if m == "manifest" => {
+            // Serialize through to_value exactly like the wire `result` field
+            // so `codex-sub manifest` is byte-identical to `plugin/manifest`.
+            let out = serde_json::to_value(manifest::manifest())
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| "{}".to_string());
+            let mut stdout = std::io::stdout().lock();
+            if writeln!(stdout, "{out}")
+                .and_then(|()| stdout.flush())
+                .is_err()
+            {
+                diag("manifest write failed: stdout closed");
+                std::process::exit(2);
+            }
+            return;
+        }
+        // `gray codex-sub tools …` and the REPL's `/codex tools …` land on
+        // the same file: one allowlist, no sidecar needed.
+        Some(t) if t == "tools" => {
+            let args: Vec<String> = std::env::args_os()
+                .skip(2)
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect();
+            println!("{}", codex_sub::settings::tools_command(&args));
+            return;
+        }
+        Some(s) if s == "status" => {
+            println!("{}", codex_sub::status::text());
+            return;
+        }
+        Some(s) if s == "help" || s == "--help" || s == "-h" => {
+            println!("{}", cli_help());
+            return;
+        }
+        Some(s) if s == "sidecar" => {}
+        Some(other) => {
+            eprintln!("unknown verb {other:?}\n\n{}", cli_help());
             std::process::exit(2);
         }
-        return;
-    }
-
-    // `gray codex-sub tools …` and the REPL's `/codex tools …` land on
-    // the same file: one allowlist, no sidecar needed.
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("tools")) {
-        let args: Vec<String> = std::env::args_os()
-            .skip(2)
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect();
-        println!("{}", codex_sub::settings::tools_command(&args));
-        return;
-    }
-
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("status")) {
-        println!("{}", codex_sub::status::text());
-        return;
+        None if std::io::IsTerminal::is_terminal(&std::io::stdin()) => {
+            println!("{}", cli_help());
+            return;
+        }
+        None => {}
     }
 
     let Some(runtime) = build_runtime() else {
