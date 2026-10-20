@@ -85,5 +85,6 @@ fn model_row(v: &Value) -> Option<ProviderModel> {
             .unwrap_or_default(),
         variants: vec![],
         slots: vec![],
+        price_cliff_tokens: None,
     })
 }

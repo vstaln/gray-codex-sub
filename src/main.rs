@@ -17,7 +17,7 @@
 //! provider-login shortcut switches the session to Codex; `/codex tools …`
 //! owns the upstream tool allowlist (`{"text": …}`).
 
-use codex_sub::{appserver, chat, manifest, models, relay, session, setup, usage};
+use codex_sub::{accounts, appserver, chat, manifest, models, relay, session, setup, usage};
 
 use std::io::{BufRead, Write};
 use std::sync::Arc;
@@ -59,42 +59,74 @@ struct Shared {
     relays: relay::Intents,
 }
 
+fn cli_help() -> String {
+    "codex-sub — ChatGPT/Codex subscription provider for gray\n\
+     usage: codex-sub manifest | sidecar | status | account [add|list|use|remove] | tools [all|bash|+name|-name|name …]\n\
+     slash:  /codex · /codex status · /codex tools … · /codex account …"
+        .to_string()
+}
+
 fn main() {
     // `gray plugin add` and registration probe `<bin> manifest`. This path
     // builds no runtime, spawns no threads, and touches no directories —
     // a host under resource limits still has to see the manifest.
     // (args_os: a non-UTF8 argv must not panic us.)
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("manifest")) {
-        // Serialize through to_value exactly like the wire `result` field
-        // so `codex-sub manifest` is byte-identical to `plugin/manifest`.
-        let out = serde_json::to_value(manifest::manifest())
-            .map(|v| v.to_string())
-            .unwrap_or_else(|_| "{}".to_string());
-        let mut stdout = std::io::stdout().lock();
-        if writeln!(stdout, "{out}")
-            .and_then(|()| stdout.flush())
-            .is_err()
-        {
-            diag("manifest write failed: stdout closed");
+    match std::env::args_os().nth(1).as_deref() {
+        Some(m) if m == "manifest" => {
+            // Serialize through to_value exactly like the wire `result` field
+            // so `codex-sub manifest` is byte-identical to `plugin/manifest`.
+            let out = serde_json::to_value(manifest::manifest())
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| "{}".to_string());
+            let mut stdout = std::io::stdout().lock();
+            if writeln!(stdout, "{out}")
+                .and_then(|()| stdout.flush())
+                .is_err()
+            {
+                diag("manifest write failed: stdout closed");
+                std::process::exit(2);
+            }
+            return;
+        }
+        // `gray codex-sub tools …` and the REPL's `/codex tools …` land on
+        // the same file: one allowlist, no sidecar needed.
+        Some(t) if t == "tools" => {
+            let args: Vec<String> = std::env::args_os()
+                .skip(2)
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect();
+            println!("{}", codex_sub::settings::tools_command(&args));
+            return;
+        }
+        // `account` on the argv path may drive `codex login`
+        // interactively — stdio is the user's terminal here, unlike the
+        // sidecar wire.
+        Some(a) if a == "account" => {
+            let args: Vec<String> = std::env::args_os()
+                .skip(2)
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect();
+            println!("{}", codex_sub::accounts::command(&args, true));
+            return;
+        }
+        Some(s) if s == "status" => {
+            println!("{}", codex_sub::status::text());
+            return;
+        }
+        Some(s) if s == "help" || s == "--help" || s == "-h" => {
+            println!("{}", cli_help());
+            return;
+        }
+        Some(s) if s == "sidecar" => {}
+        Some(other) => {
+            eprintln!("unknown verb {other:?}\n\n{}", cli_help());
             std::process::exit(2);
         }
-        return;
-    }
-
-    // `gray codex-sub tools …` and the REPL's `/codex tools …` land on
-    // the same file: one allowlist, no sidecar needed.
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("tools")) {
-        let args: Vec<String> = std::env::args_os()
-            .skip(2)
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect();
-        println!("{}", codex_sub::settings::tools_command(&args));
-        return;
-    }
-
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("status")) {
-        println!("{}", codex_sub::status::text());
-        return;
+        None if std::io::IsTerminal::is_terminal(&std::io::stdin()) => {
+            println!("{}", cli_help());
+            return;
+        }
+        None => {}
     }
 
     let Some(runtime) = build_runtime() else {
@@ -215,6 +247,11 @@ fn serve_serial(runtime: &tokio::runtime::Runtime) {
             "idle-session reaper unavailable ({e}); pooled sessions will not be reaped"
         ));
     }
+    // Re-pool sessions persisted before a restart so their upstream
+    // cache entries renew instead of lapsing — best-effort, background.
+    let _ = std::thread::Builder::new()
+        .name("codex-sub-rewarm".into())
+        .spawn(session::rewarm);
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -353,6 +390,11 @@ async fn serve(mut stdin_rx: tokio::sync::mpsc::UnboundedReceiver<String>) {
             "idle-session reaper unavailable ({e}); pooled sessions will not be reaped"
         ));
     }
+    // Re-pool sessions persisted before a restart so their upstream
+    // cache entries renew instead of lapsing — best-effort, background.
+    let _ = std::thread::Builder::new()
+        .name("codex-sub-rewarm".into())
+        .spawn(session::rewarm);
     let mut stdout = std::io::stdout();
     while let Some(line) = stdin_rx.recv().await {
         if line.trim().is_empty() {
@@ -464,8 +506,9 @@ async fn handle(shared: &Shared, request: &Request) -> Result<Value, ProviderRpc
         }
         "provider/auth/cancel" => Ok(json!({})),
         "provider/auth/refresh" => {
-            let request: ProviderRefreshRequest =
-                serde_json::from_value(params).map_err(|_| invalid("provider refresh request"))?;
+            let request: ProviderRefreshRequest = serde_json::from_value(params).map_err(|e| {
+                ProviderRpcError::Protocol(format!("bad provider/auth/refresh params: {e}"))
+            })?;
             ensure_provider(&request.provider, &request.auth_method)?;
             // "Refresh" re-probes the CLI login: tokens live in the
             // Codex home, so a fresh marker is all the host needs.
@@ -488,8 +531,9 @@ async fn handle(shared: &Shared, request: &Request) -> Result<Value, ProviderRpc
             }
         }
         "provider/auth/revoke" => {
-            let request: ProviderRevokeRequest =
-                serde_json::from_value(params).map_err(|_| invalid("provider revoke request"))?;
+            let request: ProviderRevokeRequest = serde_json::from_value(params).map_err(|e| {
+                ProviderRpcError::Protocol(format!("bad provider/auth/revoke params: {e}"))
+            })?;
             ensure_provider(&request.provider, &request.auth_method)?;
             // Revoke clears only what this plugin ever wrote: the
             // retired token mirror. The real login belongs to the CLI —
@@ -499,8 +543,9 @@ async fn handle(shared: &Shared, request: &Request) -> Result<Value, ProviderRpc
         }
         "provider/usage" => blocking(usage::handle).await?,
         "provider/models" => {
-            let request: ProviderModelsRequest =
-                serde_json::from_value(params).map_err(|_| invalid("provider models request"))?;
+            let request: ProviderModelsRequest = serde_json::from_value(params).map_err(|e| {
+                ProviderRpcError::Protocol(format!("bad provider/models params: {e}"))
+            })?;
             ensure_provider(&request.provider, &request.auth_method)?;
             let models = blocking(models::fetch).await??;
             Ok(serde_json::to_value(models).unwrap())
@@ -524,12 +569,12 @@ async fn handle(shared: &Shared, request: &Request) -> Result<Value, ProviderRpc
                 return Ok(json!({"text": blocking(codex_sub::status::text).await?}));
             }
             manifest::run_command(name, &argv)
-                .ok_or_else(|| ProviderRpcError::Protocol("unknown command".to_string()))
+                .ok_or_else(|| ProviderRpcError::Protocol(format!("unknown command: {name}")))
         }
         "plugin/shutdown" => Ok(json!({})),
-        _ => Err(ProviderRpcError::Protocol(
-            "unknown provider method".to_string(),
-        )),
+        other => Err(ProviderRpcError::Protocol(format!(
+            "method not found: {other}"
+        ))),
     }
 }
 
@@ -556,7 +601,7 @@ async fn chat_turn(relays: &relay::Intents, params: Value) -> Result<Value, Prov
     if setup::resolve_command().is_none() {
         return Err(ProviderRpcError::Unavailable(setup::INSTALL_HINT.into()));
     }
-    if !setup::cli_login_present() {
+    if !accounts::any_login() {
         return Err(ProviderRpcError::Unavailable(setup::LOGIN_HINT.into()));
     }
     let bearer = format!("codex-sub-{}", chat::rand_hex(16));
@@ -636,10 +681,6 @@ fn ensure_provider(provider: &str, auth_method: &str) -> Result<(), ProviderRpcE
             "unknown provider or auth method".to_string(),
         ))
     }
-}
-
-fn invalid(message: &'static str) -> ProviderRpcError {
-    ProviderRpcError::Protocol(message.to_string())
 }
 
 fn poll_value(poll: ProviderAuthPoll) -> Value {

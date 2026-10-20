@@ -19,10 +19,11 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Value, json};
 
@@ -45,6 +46,18 @@ const KEEPALIVE_AFTER: Duration = Duration::from_secs(10 * 60);
 const REAPER_TICK: Duration = Duration::from_secs(30);
 /// How long an interrupted turn has to settle before the child is killed.
 const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
+
+/// A persisted record and its rollout go idle past this — resume is a
+/// cache optimization, so nothing of value outlives a day.
+const RECORD_TTL: Duration = Duration::from_secs(24 * 3600);
+/// Minimum gap between record sweeps (shared across runs via a marker).
+const SWEEP_EVERY: Duration = Duration::from_secs(3600);
+/// Records this fresh get re-pooled at startup; older ones stay
+/// cold-resume points only.
+const WARM_WINDOW: Duration = Duration::from_secs(6 * 3600);
+/// A re-warmed child must finish its handshake inside this or it is
+/// dropped un-pooled.
+const REWARM_MOUNT: Duration = Duration::from_secs(30);
 
 /// stderr is captured for diagnostics only; never logged (it can carry
 /// upstream detail we don't want in trace files).
@@ -86,6 +99,9 @@ pub struct LiveSession {
     surface: String,
     model: String,
     effort: Option<String>,
+    /// The credential home this child was spawned under — claims are
+    /// scoped to it so an account never serves another's conversation.
+    home: PathBuf,
 
     /// The exact Responses `input` array this session last absorbed —
     /// the continuation prefix contract.
@@ -94,6 +110,11 @@ pub struct LiveSession {
     reply_call_ids: Vec<String>,
     reply_text: String,
 
+    /// Re-pooled from a persisted record after a plugin restart — its
+    /// first real turn is the resume's proof: a drain error there means
+    /// a stale record, so the request falls back to a fresh spawn
+    /// instead of failing.
+    pub rewarmed: bool,
     /// A Codex turn is open (`turn/started` seen, no `turn/completed`).
     /// On error this decides close-vs-keep, and blocks pool reclamation
     /// of a turn that never settled.
@@ -160,6 +181,12 @@ pub fn take(
         }
         // A turn running free (not parked on calls) can't be claimed.
         if s.prompt_in_flight && !s.suspended {
+            continue;
+        }
+        // Sessions are per-account: a thread only continues on the home
+        // it was started under.
+        if s.home != turn.home {
+            reason = "account";
             continue;
         }
         if s.surface != turn.surface {
@@ -247,16 +274,12 @@ pub fn shutdown_all() {
     }
 }
 
-/// Spawn + initialize + `account/read` login gate + `thread/start`. The
-/// returned session has an open thread and no absorbed history yet —
-/// `drive_fresh` injects and starts the first turn.
-pub fn spawn(
-    turn: &PreparedTurn,
-    deadline: Instant,
-    cancel: &Arc<AtomicBool>,
-) -> Result<LiveSession, String> {
+/// Spawn the child and wire its pipes and reader threads — everything
+/// except the handshake, which differs between a fresh `thread/start`
+/// and a persisted-record `thread/resume`.
+fn spawn_child(turn: &PreparedTurn, cancel: &Arc<AtomicBool>) -> Result<LiveSession, String> {
     let bin = setup::resolve_command().ok_or_else(|| setup::INSTALL_HINT.to_string())?;
-    let home = setup::codex_home();
+    let home = turn.home.clone();
     std::fs::create_dir_all(&home).map_err(|e| format!("codex home: {e}"))?;
     let stage = tempfile::Builder::new()
         .prefix("codex-sub-")
@@ -344,7 +367,7 @@ pub fn spawn(
         return Err(format!("app-server stdout reader thread: {e}"));
     }
 
-    let mut s = LiveSession {
+    let s = LiveSession {
         child,
         stdin,
         inbox: rx,
@@ -355,9 +378,11 @@ pub fn spawn(
         surface: turn.surface.clone(),
         model: turn.native_model.clone(),
         effort: turn.effort.clone(),
+        home: turn.home.clone(),
         absorbed: Vec::new(),
         reply_call_ids: Vec::new(),
         reply_text: String::new(),
+        rewarmed: false,
         prompt_in_flight: false,
         suspended: false,
         parked: Vec::new(),
@@ -373,6 +398,18 @@ pub fn spawn(
         closed: false,
     };
 
+    Ok(s)
+}
+
+/// Spawn + initialize + `account/read` login gate + `thread/start`. The
+/// returned session has an open thread and no absorbed history yet —
+/// `drive_fresh` injects and starts the first turn.
+pub fn spawn(
+    turn: &PreparedTurn,
+    deadline: Instant,
+    cancel: &Arc<AtomicBool>,
+) -> Result<LiveSession, String> {
+    let mut s = spawn_child(turn, cancel)?;
     s.handshake(turn, deadline)?;
     Ok(s)
 }
@@ -854,8 +891,9 @@ impl LiveSession {
         }
     }
 
-    /// initialize → initialized → `account/read` gate → thread/start.
-    fn handshake(&mut self, turn: &PreparedTurn, deadline: Instant) -> Result<(), String> {
+    /// initialize → initialized → the `account/read` login gate both
+    /// thread verbs share. Returns the handshake deadline.
+    fn init_gate(&mut self, deadline: Instant) -> Result<Instant, String> {
         let init_deadline = deadline.min(Instant::now() + CALL_TIMEOUT);
         self.call(
             "initialize",
@@ -876,14 +914,22 @@ impl LiveSession {
         if acct.get("account").is_none_or(Value::is_null) {
             return Err(setup::LOGIN_HINT.to_string());
         }
+        Ok(init_deadline)
+    }
+
+    /// initialize → initialized → `account/read` gate → thread/start.
+    fn handshake(&mut self, turn: &PreparedTurn, deadline: Instant) -> Result<(), String> {
+        let init_deadline = self.init_gate(deadline)?;
         let mut params = json!({
             "cwd": self._stage.path().to_string_lossy(),
             // Codex's own tools may never ask (there is no human) and may
             // never write; the model is told they are disabled regardless.
             "approvalPolicy": "never",
             "sandbox": "read-only",
-            // No rollout on disk — the pool keeps the thread in-process.
-            "ephemeral": true,
+            // The rollout persists so `thread/resume` can re-mount the
+            // thread after a plugin restart (see `Record`/`rewarm`);
+            // our own ledger sweeps it once it goes idle-stale.
+            "ephemeral": false,
         });
         if !turn.native_model.is_empty() {
             params["model"] = json!(turn.native_model);
@@ -907,6 +953,43 @@ impl LiveSession {
                     .ok_or_else(|| "thread/start: no thread id".to_string())
             })
             .map(|id| {
+                adopt(&id);
+                self.thread_id = id;
+            })
+    }
+
+    /// Same mount as [`handshake`] but `thread/resume`s the persisted
+    /// thread instead of starting one — the rollout must already exist
+    /// (threads are no longer ephemeral for exactly this reason). The
+    /// resumed child mounts idle: no items are injected and no turn is
+    /// started; the rollout already holds the transcript.
+    fn handshake_resume(&mut self, rec: &Record, deadline: Instant) -> Result<(), String> {
+        let init_deadline = self.init_gate(deadline)?;
+        let mut params = json!({
+            "threadId": rec.sid,
+            "cwd": self._stage.path().to_string_lossy(),
+            "approvalPolicy": "never",
+            "sandbox": "read-only",
+            // The response's hydrated turns are never read here.
+            "excludeTurns": true,
+        });
+        if !rec.model.is_empty() {
+            params["model"] = json!(rec.model);
+            params["modelProvider"] = json!("openai");
+        }
+        if !rec.system.is_empty() {
+            params["developerInstructions"] = json!(rec.system);
+        }
+        self.call("thread/resume", params, init_deadline)
+            .and_then(|r| {
+                r.get("thread")
+                    .and_then(|t| t.get("id"))
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| "thread/resume: no thread id".to_string())
+            })
+            .map(|id| {
+                adopt(&id);
                 self.thread_id = id;
             })
     }
@@ -1123,6 +1206,7 @@ fn sweep() {
         let newest = due
             && !pool.iter().any(|o| {
                 !o.closed
+                    && o.home == s.home
                     && o.surface == s.surface
                     && o.model == s.model
                     && o.effort == s.effort
@@ -1154,4 +1238,470 @@ pub fn start_reaper() -> std::io::Result<()> {
             }
         })?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Persisted pool records: a restart-safe resume point plus the
+// continuation state needed to re-pool (rewarm) or cold-resume a thread
+// instead of replaying history. Ported from claude-sub's `Record`.
+// ---------------------------------------------------------------------------
+
+/// A persisted pool entry: the `thread/resume` point plus the
+/// continuation state a restarted plugin needs to re-warm the session
+/// into the pool (see [`rewarm`]) or to claim it on a pool miss (see
+/// [`claim_record`]). Legacy files are two lines (`<sid>\n<uuid>`) —
+/// they still resume but carry no continuation state, so they can't
+/// re-warm.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+pub struct Record {
+    /// Codex thread id — the `thread/resume` point.
+    pub sid: String,
+    /// Codex resumes whole threads, so the resume point is `sid` alone;
+    /// `uuid` mirrors it so files stay shape-compatible with the
+    /// claude-sub record this format was ported from.
+    #[serde(default)]
+    pub uuid: String,
+    /// `developerInstructions` the thread was started with.
+    #[serde(default)]
+    pub system: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// The pool claim key: developer text + tool-manifest fingerprint.
+    /// `thread/resume` can't re-declare `dynamicTools`, so a record only
+    /// serves requests whose surface matches exactly.
+    #[serde(default)]
+    pub surface: String,
+    /// The request `input` array the session had absorbed at save time
+    /// — the strict-continuation prefix the next turn must extend.
+    #[serde(default)]
+    pub absorbed: Vec<Value>,
+    /// Call ids and text of the session's last answer — the echo zone
+    /// the next turn replays and `continuation` verifies.
+    #[serde(default)]
+    pub reply_call_ids: Vec<String>,
+    #[serde(default)]
+    pub reply_text: String,
+    /// Unix seconds when written; restores the warm-window clock.
+    #[serde(default)]
+    pub saved_at: u64,
+    /// The credential home the thread ran under. Empty in pre-multiacct
+    /// records — they map to the implicit account's home.
+    #[serde(default)]
+    pub home: String,
+}
+
+/// A record's credential home: explicit when stored, the resolved
+/// default for legacy records.
+fn record_home(rec: &Record) -> PathBuf {
+    if rec.home.is_empty() {
+        setup::codex_home()
+    } else {
+        PathBuf::from(&rec.home)
+    }
+}
+
+/// `$XDG_CACHE_HOME/codex-sub` (or `~/.cache/codex-sub`).
+fn cache_root() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("codex-sub")
+}
+
+/// Canonical 8-4-4-4-12 hex uuid — the thread-id shape. Checked before
+/// an id becomes a filename component.
+fn is_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
+/// Write `bytes` to `path` at mode 0600 via a sibling temp + rename, so
+/// a reader never sees a torn record. Best-effort callers ignore errors.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
+fn resume_file(key: u64) -> PathBuf {
+    cache_root().join("resume").join(format!("{key:016x}"))
+}
+
+/// Stable per-conversation record key: the claim surface plus the first
+/// history item. Host `input` arrays grow prefix-only, so element 0 is
+/// constant for a conversation; a collision just overwrites the record.
+fn conversation_key(turn: &PreparedTurn) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    turn.surface.hash(&mut h);
+    // Records are per-account: the same conversation under another home
+    // must not resume this thread.
+    turn.home.to_string_lossy().hash(&mut h);
+    if let Some(first) = turn.input.first() {
+        first.to_string().hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Parse a resume file: JSON `Record`, or the legacy two-line
+/// `<sid>\n<uuid>` point (resumable, not rewammable).
+fn record_of(text: &str) -> Option<Record> {
+    let r = if let Ok(r) = serde_json::from_str::<Record>(text) {
+        r
+    } else {
+        let mut it = text.lines();
+        let (sid, uuid) = (it.next()?.trim(), it.next()?.trim());
+        if !(is_uuid(sid) && is_uuid(uuid)) {
+            return None;
+        }
+        Record {
+            sid: sid.to_string(),
+            uuid: uuid.to_string(),
+            ..Default::default()
+        }
+    };
+    is_uuid(&r.sid).then_some(r)
+}
+
+/// The full record for `key`, if the file parses — legacy points fill
+/// only `sid`/`uuid` (resumable, not rewammable).
+fn load(key: u64) -> Option<Record> {
+    record_of(&std::fs::read_to_string(resume_file(key)).ok()?)
+}
+
+/// Every stored record with its file age, freshest first. Rewarm scans
+/// these at startup; stale or unreadable files are skipped — worst case
+/// a conversation falls back to the plain cold-start path.
+fn records() -> Vec<(Record, Duration)> {
+    let dir = cache_root().join("resume");
+    let now = SystemTime::now();
+    let mut out: Vec<(Record, Duration)> = Vec::new();
+    for p in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let Ok(text) = std::fs::read_to_string(p.path()) else {
+            continue;
+        };
+        let Some(rec) = record_of(&text) else {
+            continue;
+        };
+        let age = p
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .unwrap_or(Duration::MAX);
+        out.push((rec, age));
+    }
+    out.sort_by_key(|(_, age)| *age);
+    out
+}
+
+/// Persist the pool record for the conversation this session just
+/// settled — resume point + continuation state — so a plugin restart
+/// can re-pool or cold-resume the thread instead of replaying history.
+/// Skipped for suspended sessions: parked `item/tool/call`s live on the
+/// wire and die with the process, so no resumed child could ever answer
+/// them. Atomic (0600, tmp+rename), best-effort.
+pub fn save_record(turn: &PreparedTurn, s: &LiveSession) {
+    if s.suspended || !is_uuid(&s.thread_id) {
+        return;
+    }
+    let rec = Record {
+        sid: s.thread_id.clone(),
+        uuid: s.thread_id.clone(),
+        system: turn.system.clone(),
+        model: s.model.clone(),
+        effort: s.effort.clone(),
+        surface: s.surface.clone(),
+        absorbed: s.absorbed.clone(),
+        reply_call_ids: s.reply_call_ids.clone(),
+        reply_text: s.reply_text.clone(),
+        home: turn.home.to_string_lossy().into_owned(),
+        saved_at: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+    let Ok(text) = serde_json::to_string(&rec) else {
+        return;
+    };
+    if write_atomic(&resume_file(conversation_key(turn)), text.as_bytes()).is_err() {
+        return;
+    }
+    touch_ledger(&rec.sid);
+    sweep_if_due(
+        &cache_root(),
+        &turn.home.join("sessions"),
+        SystemTime::now(),
+    );
+}
+
+/// The rollout file for `sid`: `sessions/YYYY/MM/DD/rollout-…-<sid>.jsonl`
+/// under that account's CODEX_HOME. A record whose rollout was swept
+/// can't resume, so resume paths check this first.
+fn rollout_file(home: &Path, sid: &str) -> Option<PathBuf> {
+    let suffix = format!("{sid}.jsonl");
+    let mut dirs = vec![home.join("sessions")];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                dirs.push(p);
+            } else if p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .ends_with(&suffix)
+            {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// Whether the CLI's rollout for `sid` is still on disk under `home`.
+fn session_exists(home: &Path, sid: &str) -> bool {
+    is_uuid(sid) && rollout_file(home, sid).is_some()
+}
+
+/// Mark thread `sid` as ours, so the sweep reclaims its rollout even if
+/// the turn failed and no record names it. The entry's mtime is the
+/// thread's last use.
+fn adopt(sid: &str) {
+    if is_uuid(sid) {
+        touch_ledger(sid);
+    }
+}
+
+/// Ledger entry `sessions/<sid>` in the cache root.
+fn touch_ledger(sid: &str) {
+    let _ = write_atomic(&cache_root().join("sessions").join(sid), b"");
+}
+
+fn idle_past(path: &Path, now: SystemTime, ttl: Duration) -> bool {
+    path.symlink_metadata()
+        .and_then(|m| m.modified())
+        .is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age > ttl))
+}
+
+/// At most once per [`SWEEP_EVERY`] (marker `root/.swept`), run
+/// [`sweep_records`].
+fn sweep_if_due(root: &Path, sessions: &Path, now: SystemTime) {
+    let marker = root.join(".swept");
+    if marker.exists() && !idle_past(&marker, now, SWEEP_EVERY) {
+        return;
+    }
+    if write_atomic(&marker, b"").is_ok() {
+        sweep_records(root, sessions, now, RECORD_TTL);
+    }
+}
+
+/// Delete resume files and ledger entries idle past `ttl`, plus the
+/// rollouts of ledgered thread ids — only threads this plugin created,
+/// never a user's own sessions in a pinned CODEX_HOME.
+fn sweep_records(root: &Path, sessions: &Path, now: SystemTime, ttl: Duration) {
+    let entries = |d: PathBuf| {
+        std::fs::read_dir(d)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+    };
+    for p in entries(root.join("resume")) {
+        if idle_past(&p, now, ttl) {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+    for p in entries(root.join("sessions")) {
+        let name = p
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if !idle_past(&p, now, ttl) || !is_uuid(&name) {
+            continue;
+        }
+        let _ = std::fs::remove_file(&p);
+        let suffix = format!("{name}.jsonl");
+        let mut dirs = vec![sessions.to_path_buf()];
+        while let Some(d) = dirs.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let f = e.path();
+                if f.is_dir() {
+                    dirs.push(f);
+                } else if f
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .ends_with(&suffix)
+                {
+                    let _ = std::fs::remove_file(&f);
+                }
+            }
+        }
+    }
+}
+
+/// Re-pool one persisted session: spawn the child `thread/resume`-ed at
+/// its recorded point but leave it idle — the rollout already holds the
+/// transcript, so nothing is injected or started. The strict-
+/// continuation fields are restored from the record so the next turn
+/// matches it like a still-pooled session.
+fn spawn_resumed(
+    rec: &Record,
+    deadline: Instant,
+    cancel: &Arc<AtomicBool>,
+) -> Result<LiveSession, String> {
+    let turn = PreparedTurn {
+        system: rec.system.clone(),
+        input: Vec::new(),
+        dynamic_tools: Vec::new(),
+        surface: rec.surface.clone(),
+        native_model: rec.model.clone(),
+        effort: rec.effort.clone(),
+        home: record_home(rec),
+    };
+    let mut s = spawn_child(&turn, cancel)?;
+    s.handshake_resume(rec, deadline)?;
+    s.absorbed = rec.absorbed.clone();
+    s.reply_call_ids = rec.reply_call_ids.clone();
+    s.reply_text = rec.reply_text.clone();
+    s.rewarmed = true;
+    // Restore the idle clocks from the record's age: the keepalive
+    // cadence and the idle reap keep their true position across the
+    // restart.
+    let age = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_sub(rec.saved_at);
+    if let Some(ago) = Instant::now().checked_sub(Duration::from_secs(age)) {
+        s.last_used = ago;
+        s.last_prompt_at = ago;
+    }
+    Ok(s)
+}
+
+/// Re-pool sessions whose records are still inside the warm window. A
+/// plugin restart used to strand them: the pool died with the process
+/// and each session's upstream cache entry lapsed before its next turn.
+/// Resumed idle here, they rejoin the keepalive cycle and their cache
+/// renews on schedule — or serve the next turn as a strict
+/// continuation. Runs once at startup; a child that fails its handshake
+/// inside [`REWARM_MOUNT`] is dropped un-pooled — the record remains a
+/// cold-resume point.
+pub fn rewarm() {
+    // Records whose home left the pool (a removed account, a repointed
+    // CODEX_HOME) can't serve a turn — leave them cold-resume points.
+    let homes = crate::accounts::pool_homes();
+    for (rec, age) in records() {
+        // Freshest first: past the window every later record is older.
+        if age > WARM_WINDOW {
+            break;
+        }
+        // A sid-only record carries no continuation state — it remains a
+        // cold-resume point (`claim_record`), never a pooled session.
+        if rec.absorbed.is_empty() || !session_exists(&record_home(&rec), &rec.sid) {
+            continue;
+        }
+        if !homes.contains(&record_home(&rec)) {
+            continue;
+        }
+        {
+            let pool = match POOL.lock() {
+                Ok(p) => p,
+                Err(e) => e.into_inner(),
+            };
+            if pool.len() >= MAX_SESSIONS {
+                break;
+            }
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Ok(s) = spawn_resumed(&rec, Instant::now() + REWARM_MOUNT, &cancel) {
+            give_back(s);
+        }
+    }
+}
+
+/// Pool miss: resume this conversation's persisted thread when the
+/// record still matches the request — a strict continuation on the real
+/// transcript instead of a replayed cold start. Sid-only records resume
+/// blind (nothing to match): the fresh-split tail drives the turn and
+/// `absorb` fixes the continuation state after it settles.
+pub fn claim_record(
+    turn: &PreparedTurn,
+    deadline: Instant,
+    cancel: &Arc<AtomicBool>,
+) -> Option<(LiveSession, Claim)> {
+    let rec = load(conversation_key(turn))?;
+    if record_home(&rec) != turn.home {
+        return None;
+    }
+    if !rec.absorbed.is_empty()
+        && (rec.surface != turn.surface
+            || rec.model != turn.native_model
+            || rec.effort != turn.effort)
+    {
+        // Same claim contract as `take`: a changed toolset, developer
+        // text or model spawns fresh. A sid-only record has no surface
+        // to verify — it resumes blind.
+        return None;
+    }
+    if !session_exists(&turn.home, &rec.sid) {
+        return None;
+    }
+    {
+        // A thread already pooled in-process must not be resumed twice.
+        let pool = match POOL.lock() {
+            Ok(p) => p,
+            Err(e) => e.into_inner(),
+        };
+        if pool.iter().any(|s| !s.closed && s.thread_id == rec.sid) {
+            return None;
+        }
+    }
+    let claim = if rec.absorbed.is_empty() {
+        let tail = &turn.input[chat::fresh_split(&turn.input)..];
+        if tail.is_empty() {
+            return None;
+        }
+        Claim::Delta {
+            tail: tail.to_vec(),
+            undelivered: false,
+        }
+    } else {
+        let (tail, undelivered) = chat::continuation(
+            &rec.absorbed,
+            &rec.reply_call_ids,
+            &rec.reply_text,
+            &turn.input,
+        )
+        .ok()?;
+        Claim::Delta {
+            tail: tail.to_vec(),
+            undelivered,
+        }
+    };
+    let s = spawn_resumed(&rec, deadline, cancel).ok()?;
+    Some((s, claim))
 }

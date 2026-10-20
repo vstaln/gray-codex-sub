@@ -97,7 +97,12 @@ pub fn cli_version() -> Option<String> {
 /// an existence check only, used for a fast pre-chat error. Its bytes
 /// are never read by this plugin; `account/read` is the authority.
 pub fn cli_login_present() -> bool {
-    codex_home().join("auth.json").is_file() || codex_home().join("config.toml").is_file()
+    login_present(&codex_home())
+}
+/// Same check for one credential home — the multi-account pool asks per
+/// account, the zero-config path asks for the resolved home.
+pub fn login_present(home: &std::path::Path) -> bool {
+    home.join("auth.json").is_file() || home.join("config.toml").is_file()
 }
 /// Legacy mirror of borrowed ChatGPT tokens written by versions <= 0.2.0.
 /// Reported, never read; removed only on an explicit user revoke.

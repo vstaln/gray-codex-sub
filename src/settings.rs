@@ -107,6 +107,9 @@ fn valid_name(name: &str) -> bool {
 pub fn command(argv: &[String]) -> String {
     match argv.first().map(String::as_str) {
         Some("tools") => tools_command(&argv[1..]),
+        // The sidecar wire can't drive an interactive `codex login`, so
+        // `add` over this path only registers an already-logged-in home.
+        Some("account") => crate::accounts::command(&argv[1..], false),
         _ => format!("{USAGE}\n\n{}", status_line(&ToolPolicy::load())),
     }
 }
