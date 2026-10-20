@@ -17,7 +17,7 @@
 //! provider-login shortcut switches the session to Codex; `/codex tools …`
 //! owns the upstream tool allowlist (`{"text": …}`).
 
-use codex_sub::{appserver, chat, manifest, models, relay, session, setup, usage};
+use codex_sub::{accounts, appserver, chat, manifest, models, relay, session, setup, usage};
 
 use std::io::{BufRead, Write};
 use std::sync::Arc;
@@ -61,8 +61,8 @@ struct Shared {
 
 fn cli_help() -> String {
     "codex-sub — ChatGPT/Codex subscription provider for gray\n\
-     usage: codex-sub manifest | sidecar | status | tools [all|bash|+name|-name|name …]\n\
-     slash:  /codex · /codex status · /codex tools …"
+     usage: codex-sub manifest | sidecar | status | account [add|list|use|remove] | tools [all|bash|+name|-name|name …]\n\
+     slash:  /codex · /codex status · /codex tools … · /codex account …"
         .to_string()
 }
 
@@ -96,6 +96,17 @@ fn main() {
                 .map(|s| s.to_string_lossy().into_owned())
                 .collect();
             println!("{}", codex_sub::settings::tools_command(&args));
+            return;
+        }
+        // `account` on the argv path may drive `codex login`
+        // interactively — stdio is the user's terminal here, unlike the
+        // sidecar wire.
+        Some(a) if a == "account" => {
+            let args: Vec<String> = std::env::args_os()
+                .skip(2)
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect();
+            println!("{}", codex_sub::accounts::command(&args, true));
             return;
         }
         Some(s) if s == "status" => {
@@ -590,7 +601,7 @@ async fn chat_turn(relays: &relay::Intents, params: Value) -> Result<Value, Prov
     if setup::resolve_command().is_none() {
         return Err(ProviderRpcError::Unavailable(setup::INSTALL_HINT.into()));
     }
-    if !setup::cli_login_present() {
+    if !accounts::any_login() {
         return Err(ProviderRpcError::Unavailable(setup::LOGIN_HINT.into()));
     }
     let bearer = format!("codex-sub-{}", chat::rand_hex(16));

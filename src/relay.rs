@@ -310,11 +310,52 @@ fn run_turn(
         .ok_or_else(|| "relay intent expired".to_string())?;
     let body: Value = serde_json::from_slice(raw)
         .map_err(|e| format!("relay body is not JSON ({} bytes): {e}", raw.len()))?;
-    let turn = crate::chat::prepare_turn(&body, &intent.model)?;
-    // A pooled session when this history continues one, else a fresh
-    // spawn — either way the turn runs on one app-server thread.
-    let result = crate::chat::run_turn(&turn, cancel, Duration::from_secs(600))?;
-    crate::chat::fold_result(&result, &intent.model)
+    let mut turn = crate::chat::prepare_turn(&body, &intent.model)?;
+    // Account failover, 9router-style: pick → turn → on an auth/429
+    // failure bench that account and re-pick. A request-scoped error
+    // returns untouched — it must never cool an account. The whole SSE
+    // body is buffered before the HTTP response commits, so a failover
+    // is invisible to the host.
+    let mut excluded = std::collections::BTreeSet::new();
+    let mut last_err = String::new();
+    loop {
+        let account = match crate::accounts::pick(&excluded) {
+            Ok(a) => a,
+            Err(e) => {
+                return Err(if last_err.is_empty() {
+                    e
+                } else {
+                    format!("{e} · last error: {last_err}")
+                });
+            }
+        };
+        turn.home = account.home.clone();
+        match crate::chat::run_turn(&turn, cancel, Duration::from_secs(600)) {
+            Ok(result) => {
+                crate::accounts::note_used(&account);
+                return crate::chat::fold_result(&result, &intent.model);
+            }
+            Err(e) => {
+                let pool_n = crate::accounts::pool().len();
+                // A pool this small has nowhere to fail over to — cap the
+                // bench so it can't mask the real error next request.
+                let sole = pool_n.saturating_sub(excluded.len()) <= 1;
+                match crate::accounts::failure_bench(&e, sole) {
+                    Some(until) => {
+                        crate::accounts::mark_cooled(&account, &e, until);
+                        excluded.insert(account.label.clone());
+                        if excluded.len() >= pool_n {
+                            return Err(format!(
+                                "all {pool_n} codex account(s) failed: {e}"
+                            ));
+                        }
+                        last_err = e;
+                    }
+                    None => return Err(e),
+                }
+            }
+        }
+    }
 }
 
 fn write_resp(s: &mut std::net::TcpStream, status: u16, body: &[u8]) {

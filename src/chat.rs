@@ -61,6 +61,10 @@ pub struct PreparedTurn {
     pub native_model: String,
     /// `reasoning.effort` passthrough (`turn/start.effort`).
     pub effort: Option<String>,
+    /// The serving account's credential home: the spawned child's
+    /// CODEX_HOME. Pool claims, resume records and rollouts are scoped to
+    /// it — no account ever inherits another's thread.
+    pub home: std::path::PathBuf,
 }
 
 /// Normalize a tool input schema: strip top-level `oneOf`/`allOf`/`anyOf`
@@ -231,6 +235,9 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
         surface,
         native_model: model.to_string(),
         effort,
+        // The relay loop overwrites this with the picked account's home;
+        // `serving_home` is the sane default for any other caller.
+        home: crate::accounts::serving_home(),
     })
 }
 

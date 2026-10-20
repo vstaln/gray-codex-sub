@@ -99,6 +99,9 @@ pub struct LiveSession {
     surface: String,
     model: String,
     effort: Option<String>,
+    /// The credential home this child was spawned under — claims are
+    /// scoped to it so an account never serves another's conversation.
+    home: PathBuf,
 
     /// The exact Responses `input` array this session last absorbed —
     /// the continuation prefix contract.
@@ -178,6 +181,12 @@ pub fn take(
         }
         // A turn running free (not parked on calls) can't be claimed.
         if s.prompt_in_flight && !s.suspended {
+            continue;
+        }
+        // Sessions are per-account: a thread only continues on the home
+        // it was started under.
+        if s.home != turn.home {
+            reason = "account";
             continue;
         }
         if s.surface != turn.surface {
@@ -270,7 +279,7 @@ pub fn shutdown_all() {
 /// and a persisted-record `thread/resume`.
 fn spawn_child(turn: &PreparedTurn, cancel: &Arc<AtomicBool>) -> Result<LiveSession, String> {
     let bin = setup::resolve_command().ok_or_else(|| setup::INSTALL_HINT.to_string())?;
-    let home = setup::codex_home();
+    let home = turn.home.clone();
     std::fs::create_dir_all(&home).map_err(|e| format!("codex home: {e}"))?;
     let stage = tempfile::Builder::new()
         .prefix("codex-sub-")
@@ -369,6 +378,7 @@ fn spawn_child(turn: &PreparedTurn, cancel: &Arc<AtomicBool>) -> Result<LiveSess
         surface: turn.surface.clone(),
         model: turn.native_model.clone(),
         effort: turn.effort.clone(),
+        home: turn.home.clone(),
         absorbed: Vec::new(),
         reply_call_ids: Vec::new(),
         reply_text: String::new(),
@@ -1196,6 +1206,7 @@ fn sweep() {
         let newest = due
             && !pool.iter().any(|o| {
                 !o.closed
+                    && o.home == s.home
                     && o.surface == s.surface
                     && o.model == s.model
                     && o.effort == s.effort
@@ -1275,6 +1286,20 @@ pub struct Record {
     /// Unix seconds when written; restores the warm-window clock.
     #[serde(default)]
     pub saved_at: u64,
+    /// The credential home the thread ran under. Empty in pre-multiacct
+    /// records — they map to the implicit account's home.
+    #[serde(default)]
+    pub home: String,
+}
+
+/// A record's credential home: explicit when stored, the resolved
+/// default for legacy records.
+fn record_home(rec: &Record) -> PathBuf {
+    if rec.home.is_empty() {
+        setup::codex_home()
+    } else {
+        PathBuf::from(&rec.home)
+    }
 }
 
 /// `$XDG_CACHE_HOME/codex-sub` (or `~/.cache/codex-sub`).
@@ -1329,6 +1354,9 @@ fn conversation_key(turn: &PreparedTurn) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     turn.surface.hash(&mut h);
+    // Records are per-account: the same conversation under another home
+    // must not resume this thread.
+    turn.home.to_string_lossy().hash(&mut h);
     if let Some(first) = turn.input.first() {
         first.to_string().hash(&mut h);
     }
@@ -1407,6 +1435,7 @@ pub fn save_record(turn: &PreparedTurn, s: &LiveSession) {
         absorbed: s.absorbed.clone(),
         reply_call_ids: s.reply_call_ids.clone(),
         reply_text: s.reply_text.clone(),
+        home: turn.home.to_string_lossy().into_owned(),
         saved_at: SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1421,17 +1450,17 @@ pub fn save_record(turn: &PreparedTurn, s: &LiveSession) {
     touch_ledger(&rec.sid);
     sweep_if_due(
         &cache_root(),
-        &setup::codex_home().join("sessions"),
+        &turn.home.join("sessions"),
         SystemTime::now(),
     );
 }
 
 /// The rollout file for `sid`: `sessions/YYYY/MM/DD/rollout-…-<sid>.jsonl`
-/// under the child's CODEX_HOME. A record whose rollout was swept can't
-/// resume, so resume paths check this first.
-fn rollout_file(sid: &str) -> Option<PathBuf> {
+/// under that account's CODEX_HOME. A record whose rollout was swept
+/// can't resume, so resume paths check this first.
+fn rollout_file(home: &Path, sid: &str) -> Option<PathBuf> {
     let suffix = format!("{sid}.jsonl");
-    let mut dirs = vec![setup::codex_home().join("sessions")];
+    let mut dirs = vec![home.join("sessions")];
     while let Some(d) = dirs.pop() {
         for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
             let p = e.path();
@@ -1450,9 +1479,9 @@ fn rollout_file(sid: &str) -> Option<PathBuf> {
     None
 }
 
-/// Whether the CLI's rollout for `sid` is still on disk.
-fn session_exists(sid: &str) -> bool {
-    is_uuid(sid) && rollout_file(sid).is_some()
+/// Whether the CLI's rollout for `sid` is still on disk under `home`.
+fn session_exists(home: &Path, sid: &str) -> bool {
+    is_uuid(sid) && rollout_file(home, sid).is_some()
 }
 
 /// Mark thread `sid` as ours, so the sweep reclaims its rollout even if
@@ -1550,6 +1579,7 @@ fn spawn_resumed(
         surface: rec.surface.clone(),
         native_model: rec.model.clone(),
         effort: rec.effort.clone(),
+        home: record_home(rec),
     };
     let mut s = spawn_child(&turn, cancel)?;
     s.handshake_resume(rec, deadline)?;
@@ -1581,6 +1611,9 @@ fn spawn_resumed(
 /// inside [`REWARM_MOUNT`] is dropped un-pooled — the record remains a
 /// cold-resume point.
 pub fn rewarm() {
+    // Records whose home left the pool (a removed account, a repointed
+    // CODEX_HOME) can't serve a turn — leave them cold-resume points.
+    let homes = crate::accounts::pool_homes();
     for (rec, age) in records() {
         // Freshest first: past the window every later record is older.
         if age > WARM_WINDOW {
@@ -1588,7 +1621,10 @@ pub fn rewarm() {
         }
         // A sid-only record carries no continuation state — it remains a
         // cold-resume point (`claim_record`), never a pooled session.
-        if rec.absorbed.is_empty() || !session_exists(&rec.sid) {
+        if rec.absorbed.is_empty() || !session_exists(&record_home(&rec), &rec.sid) {
+            continue;
+        }
+        if !homes.contains(&record_home(&rec)) {
             continue;
         }
         {
@@ -1618,6 +1654,9 @@ pub fn claim_record(
     cancel: &Arc<AtomicBool>,
 ) -> Option<(LiveSession, Claim)> {
     let rec = load(conversation_key(turn))?;
+    if record_home(&rec) != turn.home {
+        return None;
+    }
     if !rec.absorbed.is_empty()
         && (rec.surface != turn.surface
             || rec.model != turn.native_model
@@ -1628,7 +1667,7 @@ pub fn claim_record(
         // to verify — it resumes blind.
         return None;
     }
-    if !session_exists(&rec.sid) {
+    if !session_exists(&turn.home, &rec.sid) {
         return None;
     }
     {

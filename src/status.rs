@@ -69,7 +69,19 @@ pub fn text() -> String {
             }
         }
     }
-    out.push_str(&format!("\n  home:  {}", setup::codex_home().display()));
+    let pool = crate::accounts::pool();
+    if pool.iter().any(|a| !a.implicit) {
+        let s = crate::accounts::serving();
+        out.push_str(&format!(
+            "\n  acct:  {} (serving, pool of {})",
+            s.label,
+            pool.len()
+        ));
+    }
+    out.push_str(&format!(
+        "\n  home:  {}",
+        crate::accounts::serving_home().display()
+    ));
     if setup::legacy_auth_file().is_file() {
         out.push_str(
             "\n  note:  retired credential mirror gray-auth.json still on disk — \

@@ -66,12 +66,15 @@ pub struct Client {
     next_id: u64,
 }
 impl Client {
-    /// Spawn `codex app-server`, run the initialize handshake, and return
-    /// a client ready for calls.
+    /// Spawn under the serving account's home (see [`crate::accounts`]).
     pub fn spawn() -> Result<Client, Error> {
+        Self::spawn_at(&crate::accounts::serving_home())
+    }
+    /// Spawn `codex app-server` under one credential home, run the
+    /// initialize handshake, and return a client ready for calls.
+    pub fn spawn_at(home: &std::path::Path) -> Result<Client, Error> {
         let bin = setup::resolve_command().ok_or(Error::NotInstalled)?;
-        let home = setup::codex_home();
-        std::fs::create_dir_all(&home).map_err(|e| Error::Io(format!("codex home: {e}")))?;
+        std::fs::create_dir_all(home).map_err(|e| Error::Io(format!("codex home: {e}")))?;
         let stage = tempfile::Builder::new()
             .prefix("codex-sub-probe-")
             .tempdir()
@@ -79,7 +82,7 @@ impl Client {
         let mut cmd = Command::new(&bin);
         cmd.arg("app-server")
             .current_dir(stage.path())
-            .envs(setup::child_env(&home))
+            .envs(setup::child_env(home))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -213,6 +216,14 @@ pub fn with_client<T>(f: impl FnOnce(&mut Client) -> Result<T, Error>) -> Result
     let mut client = Client::spawn()?;
     f(&mut client)
 }
+/// `with_client` against one credential home.
+pub fn with_client_at<T>(
+    home: &std::path::Path,
+    f: impl FnOnce(&mut Client) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let mut client = Client::spawn_at(home)?;
+    f(&mut client)
+}
 /// What `account/read` found.
 #[derive(Debug)]
 pub enum Probe {
@@ -225,7 +236,11 @@ pub enum Probe {
 }
 /// Who is signed in, per the CLI's own stored login.
 pub fn probe() -> Probe {
-    match with_client(|c| c.call("account/read", json!({}))) {
+    probe_at(&crate::accounts::serving_home())
+}
+/// `probe` against one credential home — per-account sign-in checks.
+pub fn probe_at(home: &std::path::Path) -> Probe {
+    match with_client_at(home, |c| c.call("account/read", json!({}))) {
         Err(Error::NotInstalled) => Probe::NotInstalled,
         Err(e) => Probe::Failed(e.to_string()),
         Ok(v) => {
