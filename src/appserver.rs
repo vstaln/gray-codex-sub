@@ -11,6 +11,7 @@ use crate::setup;
 use gray_plugin::ProviderRpcError;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -69,9 +70,12 @@ impl Client {
     /// Spawn `codex app-server`, run the initialize handshake, and return
     /// a client ready for calls.
     pub fn spawn() -> Result<Client, Error> {
+        Client::spawn_at(&setup::codex_home())
+    }
+
+    pub fn spawn_at(home: &Path) -> Result<Client, Error> {
         let bin = setup::resolve_command().ok_or(Error::NotInstalled)?;
-        let home = setup::codex_home();
-        std::fs::create_dir_all(&home).map_err(|e| Error::Io(format!("codex home: {e}")))?;
+        std::fs::create_dir_all(home).map_err(|e| Error::Io(format!("codex home: {e}")))?;
         let stage = tempfile::Builder::new()
             .prefix("codex-sub-probe-")
             .tempdir()
@@ -79,7 +83,7 @@ impl Client {
         let mut cmd = Command::new(&bin);
         cmd.arg("app-server")
             .current_dir(stage.path())
-            .envs(setup::child_env(&home))
+            .envs(setup::child_env(home))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -210,7 +214,14 @@ fn read_lines(stdout: ChildStdout, tx: mpsc::Sender<Wire>) {
 }
 /// Run `f` against a fresh probe client; the child dies when it returns.
 pub fn with_client<T>(f: impl FnOnce(&mut Client) -> Result<T, Error>) -> Result<T, Error> {
-    let mut client = Client::spawn()?;
+    with_client_at(&setup::codex_home(), f)
+}
+
+pub fn with_client_at<T>(
+    home: &Path,
+    f: impl FnOnce(&mut Client) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let mut client = Client::spawn_at(home)?;
     f(&mut client)
 }
 /// What `account/read` found.
@@ -225,7 +236,11 @@ pub enum Probe {
 }
 /// Who is signed in, per the CLI's own stored login.
 pub fn probe() -> Probe {
-    match with_client(|c| c.call("account/read", json!({}))) {
+    probe_at(&setup::codex_home())
+}
+
+pub fn probe_at(home: &Path) -> Probe {
+    match with_client_at(home, |c| c.call("account/read", json!({}))) {
         Err(Error::NotInstalled) => Probe::NotInstalled,
         Err(e) => Probe::Failed(e.to_string()),
         Ok(v) => {

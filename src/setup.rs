@@ -6,7 +6,7 @@
 //! CLI reads and rotates itself. This plugin never opens that file — the
 //! app-server children are authenticated entirely by the CLI's stored
 //! login.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 /// `codex` is missing (or not on PATH): install hint, never a spawn panic.
 pub const INSTALL_HINT: &str = "`codex` not found on PATH. Install the Codex CLI (>= 0.154), then \
@@ -96,8 +96,8 @@ pub fn cli_version() -> Option<String> {
 /// The CLI's own login file under the managed (or pinned) Codex home —
 /// an existence check only, used for a fast pre-chat error. Its bytes
 /// are never read by this plugin; `account/read` is the authority.
-pub fn cli_login_present() -> bool {
-    codex_home().join("auth.json").is_file() || codex_home().join("config.toml").is_file()
+pub fn cli_login_present_at(home: &Path) -> bool {
+    home.join("auth.json").is_file() || home.join("config.toml").is_file()
 }
 /// Legacy mirror of borrowed ChatGPT tokens written by versions <= 0.2.0.
 /// Reported, never read; removed only on an explicit user revoke.

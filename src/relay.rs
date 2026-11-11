@@ -88,6 +88,7 @@ fn wait_turn(
 /// What `provider/chat` parked for one turn: the relay fills the body in.
 pub struct RelayIntent {
     pub model: String,
+    pub account: Option<crate::accounts::Pick>,
 }
 
 pub type Intents = Arc<Mutex<HashMap<String, RelayIntent>>>;
@@ -310,7 +311,10 @@ fn run_turn(
         .ok_or_else(|| "relay intent expired".to_string())?;
     let body: Value = serde_json::from_slice(raw)
         .map_err(|e| format!("relay body is not JSON ({} bytes): {e}", raw.len()))?;
-    let turn = crate::chat::prepare_turn(&body, &intent.model)?;
+    let turn = crate::chat::prepare_turn(&body, &intent.model, intent.account.clone())?;
+    if let Some(p) = &turn.account {
+        crate::accounts::book(&p.label);
+    }
     // A pooled session when this history continues one, else a fresh
     // spawn — either way the turn runs on one app-server thread.
     let result = crate::chat::run_turn(&turn, cancel, Duration::from_secs(600))?;

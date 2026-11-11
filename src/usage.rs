@@ -5,6 +5,7 @@
 use crate::{appserver, setup};
 use gray_plugin::ProviderRpcError;
 use serde_json::{Value, json};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -12,7 +13,7 @@ fn now_secs() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
-fn iso(secs: u64) -> String {
+pub(crate) fn iso(secs: u64) -> String {
     let days = (secs / 86400) as i64;
     let tod = secs % 86400;
     let (y, m, d) = civil(days);
@@ -121,14 +122,26 @@ pub fn card(account: &Value, limits: &Value) -> Value {
 }
 /// `provider/usage` entry point: one probe client, two reads.
 pub fn handle() -> Result<Value, ProviderRpcError> {
-    let (account, limits) = appserver::with_client(|c| {
-        let account = c.call("account/read", json!({}))?;
-        let limits = c.call("account/rateLimits/read", json!({}))?;
-        Ok((account, limits))
-    })
-    .map_err(ProviderRpcError::from)?;
+    let home = crate::accounts::probe_home().map_err(ProviderRpcError::Unavailable)?;
+    let (account, limits) = read_both(&home).map_err(ProviderRpcError::from)?;
     if account.get("account").is_none_or(Value::is_null) {
         return Err(ProviderRpcError::Unavailable(setup::LOGIN_HINT.into()));
     }
     Ok(card(&account, &limits))
+}
+
+pub fn card_at(home: &Path) -> Result<Value, String> {
+    let (account, limits) = read_both(home).map_err(|e| e.to_string())?;
+    if account.get("account").is_none_or(Value::is_null) {
+        return Err(format!("no login in {}", home.display()));
+    }
+    Ok(card(&account, &limits))
+}
+
+fn read_both(home: &Path) -> Result<(Value, Value), appserver::Error> {
+    appserver::with_client_at(home, |c| {
+        let account = c.call("account/read", json!({}))?;
+        let limits = c.call("account/rateLimits/read", json!({}))?;
+        Ok((account, limits))
+    })
 }

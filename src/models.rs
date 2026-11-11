@@ -17,7 +17,8 @@ fn unavailable(message: impl Into<String>) -> ProviderRpcError {
 /// One catalog fetch: paged `model/list` over a single probe client.
 pub fn fetch() -> Result<ProviderModelCatalog, ProviderRpcError> {
     let mut models = Vec::new();
-    appserver::with_client(|client| {
+    let home = crate::accounts::probe_home().map_err(ProviderRpcError::Unavailable)?;
+    appserver::with_client_at(&home, |client| {
         let mut cursor = Value::Null;
         loop {
             let resp = client.call(

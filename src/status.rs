@@ -31,8 +31,15 @@ fn account_line(account: &Value) -> String {
     }
 }
 pub fn text() -> String {
+    match crate::accounts::probe_home() {
+        Ok(home) => text_at(&home),
+        Err(e) => format!("Codex (ChatGPT subscription via Codex CLI)\n  accounts: {e}"),
+    }
+}
+
+pub fn text_at(home: &std::path::Path) -> String {
     let mut out = "Codex (ChatGPT subscription via Codex CLI)".to_string();
-    let probed = appserver::with_client(|c| {
+    let probed = appserver::with_client_at(home, |c| {
         let account = c.call("account/read", json!({}))?;
         // A failed usage read must not kill the status panel.
         let limits = c
@@ -69,7 +76,7 @@ pub fn text() -> String {
             }
         }
     }
-    out.push_str(&format!("\n  home:  {}", setup::codex_home().display()));
+    out.push_str(&format!("\n  home:  {}", home.display()));
     if setup::legacy_auth_file().is_file() {
         out.push_str(
             "\n  note:  retired credential mirror gray-auth.json still on disk — \

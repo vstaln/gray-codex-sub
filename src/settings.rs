@@ -107,6 +107,7 @@ fn valid_name(name: &str) -> bool {
 pub fn command(argv: &[String]) -> String {
     match argv.first().map(String::as_str) {
         Some("tools") => tools_command(&argv[1..]),
+        Some("account") => crate::accounts::command(&argv[1..], false).unwrap_or_else(|e| e),
         _ => format!("{USAGE}\n\n{}", status_line(&ToolPolicy::load())),
     }
 }
@@ -114,6 +115,7 @@ pub fn command(argv: &[String]) -> String {
 const USAGE: &str = "\
 /codex — switch the session to Codex (connect → model picker).
 /codex status — login, plan, and quota windows.
+/codex account — pooled Codex logins: list, add, use, remove, strategy, status, usage.
 /codex tools — which harness tools the upstream Codex model may call.
   /codex tools          show the current policy
   /codex tools all      allow every harness tool the host sends

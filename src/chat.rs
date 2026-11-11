@@ -61,6 +61,16 @@ pub struct PreparedTurn {
     pub native_model: String,
     /// `reasoning.effort` passthrough (`turn/start.effort`).
     pub effort: Option<String>,
+    pub account: Option<crate::accounts::Pick>,
+}
+
+impl PreparedTurn {
+    pub(crate) fn account_label(&self) -> &str {
+        self.account
+            .as_ref()
+            .map(|p| p.label.as_str())
+            .unwrap_or("")
+    }
 }
 
 /// Normalize a tool input schema: strip top-level `oneOf`/`allOf`/`anyOf`
@@ -122,7 +132,11 @@ fn text_of(blocks: &Value) -> String {
 }
 
 /// Translate an OpenAI Responses body into one prepared turn.
-pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
+pub fn prepare_turn(
+    body: &Value,
+    model: &str,
+    account: Option<crate::accounts::Pick>,
+) -> Result<PreparedTurn, String> {
     let instructions = body
         .get("instructions")
         .and_then(Value::as_str)
@@ -231,6 +245,7 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
         surface,
         native_model: model.to_string(),
         effort,
+        account,
     })
 }
 
@@ -546,6 +561,16 @@ pub fn run_turn(
     cancel: &Arc<AtomicBool>,
     timeout: Duration,
 ) -> Result<TurnResult, String> {
+    let (result, fault) = run_turn_inner(turn, cancel, timeout);
+    crate::accounts::settle_turn(turn.account.as_ref(), fault, &result);
+    result
+}
+
+fn run_turn_inner(
+    turn: &PreparedTurn,
+    cancel: &Arc<AtomicBool>,
+    timeout: Duration,
+) -> (Result<TurnResult, String>, Option<crate::accounts::Fault>) {
     let deadline = Instant::now() + timeout;
     let (claimed, reason) = session::take(turn, cancel);
     // Pool miss: a persisted record may still resume this conversation's
@@ -561,7 +586,7 @@ pub fn run_turn(
                     session::save_record(turn, &s);
                     trace_turn(&mode, &s.debug_label(), turn.input.len(), Some(&r), None);
                     session::give_back(s);
-                    Ok(r)
+                    (Ok(r), None)
                 }
                 Err(e) => {
                     trace_turn(&mode, &s.debug_label(), turn.input.len(), None, Some(&e));
@@ -573,12 +598,13 @@ pub fn run_turn(
                         s.close();
                         return fresh_turn(turn, "rewarm_dead", deadline, cancel);
                     }
+                    let fault = s.fault();
                     if s.prompt_in_flight {
                         s.close();
                     } else {
                         session::give_back(s);
                     }
-                    Err(e)
+                    (Err(e), fault)
                 }
             }
         }
@@ -594,7 +620,7 @@ fn fresh_turn(
     reason: &str,
     deadline: Instant,
     cancel: &Arc<AtomicBool>,
-) -> Result<TurnResult, String> {
+) -> (Result<TurnResult, String>, Option<crate::accounts::Fault>) {
     let mut s = match session::spawn(turn, deadline, cancel) {
         Ok(s) => s,
         Err(e) => {
@@ -605,7 +631,8 @@ fn fresh_turn(
                 None,
                 Some(&e),
             );
-            return Err(e);
+            let fault = crate::appserver::is_auth_error(&e).then_some(crate::accounts::Fault::Auth);
+            return (Err(e), fault);
         }
     };
     let mode = format!("fresh:{reason}");
@@ -615,10 +642,11 @@ fn fresh_turn(
             session::save_record(turn, &s);
             trace_turn(&mode, &s.debug_label(), turn.input.len(), Some(&r), None);
             session::give_back(s);
-            Ok(r)
+            (Ok(r), None)
         }
         Err(e) => {
             trace_turn(&mode, &s.debug_label(), turn.input.len(), None, Some(&e));
+            let fault = s.fault();
             if s.prompt_in_flight {
                 s.close();
             } else {
@@ -629,7 +657,7 @@ fn fresh_turn(
                 s.absorb_failed(turn);
                 session::give_back(s);
             }
-            Err(e)
+            (Err(e), fault)
         }
     }
 }

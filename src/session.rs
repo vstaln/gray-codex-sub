@@ -99,6 +99,7 @@ pub struct LiveSession {
     surface: String,
     model: String,
     effort: Option<String>,
+    pub account: String,
 
     /// The exact Responses `input` array this session last absorbed —
     /// the continuation prefix contract.
@@ -128,6 +129,7 @@ pub struct LiveSession {
     /// `usage_total` snapshot at turn start — a turn's usage is the diff.
     usage_turn_start: Usage,
     pending_error: Option<String>,
+    pending_fault: Option<crate::accounts::Fault>,
     current_turn_id: Option<String>,
 
     last_used: Instant,
@@ -178,6 +180,10 @@ pub fn take(
         }
         // A turn running free (not parked on calls) can't be claimed.
         if s.prompt_in_flight && !s.suspended {
+            continue;
+        }
+        if s.account != turn.account_label() {
+            reason = "account";
             continue;
         }
         if s.surface != turn.surface {
@@ -265,12 +271,31 @@ pub fn shutdown_all() {
     }
 }
 
+pub fn shutdown_account(label: &str) {
+    let mut pool = match POOL.lock() {
+        Ok(p) => p,
+        Err(e) => e.into_inner(),
+    };
+    let mut keep = Vec::with_capacity(pool.len());
+    for mut s in pool.drain(..) {
+        if s.account == label {
+            s.close();
+        } else {
+            keep.push(s);
+        }
+    }
+    pool.extend(keep);
+}
+
 /// Spawn the child and wire its pipes and reader threads — everything
 /// except the handshake, which differs between a fresh `thread/start`
 /// and a persisted-record `thread/resume`.
 fn spawn_child(turn: &PreparedTurn, cancel: &Arc<AtomicBool>) -> Result<LiveSession, String> {
     let bin = setup::resolve_command().ok_or_else(|| setup::INSTALL_HINT.to_string())?;
-    let home = setup::codex_home();
+    let home = match &turn.account {
+        Some(p) => p.home.clone(),
+        None => setup::codex_home(),
+    };
     std::fs::create_dir_all(&home).map_err(|e| format!("codex home: {e}"))?;
     let stage = tempfile::Builder::new()
         .prefix("codex-sub-")
@@ -369,6 +394,7 @@ fn spawn_child(turn: &PreparedTurn, cancel: &Arc<AtomicBool>) -> Result<LiveSess
         surface: turn.surface.clone(),
         model: turn.native_model.clone(),
         effort: turn.effort.clone(),
+        account: turn.account_label().to_string(),
         absorbed: Vec::new(),
         reply_call_ids: Vec::new(),
         reply_text: String::new(),
@@ -381,6 +407,7 @@ fn spawn_child(turn: &PreparedTurn, cancel: &Arc<AtomicBool>) -> Result<LiveSess
         usage_total: Usage::default(),
         usage_turn_start: Usage::default(),
         pending_error: None,
+        pending_fault: None,
         current_turn_id: None,
         last_used: Instant::now(),
         last_prompt_at: Instant::now(),
@@ -420,6 +447,10 @@ fn stderr_tail(ring: &Arc<Mutex<VecDeque<String>>>) -> String {
 }
 
 impl LiveSession {
+    pub fn fault(&self) -> Option<crate::accounts::Fault> {
+        self.pending_fault
+    }
+
     pub fn debug_label(&self) -> String {
         format!("pid={} thread={}", self.child.id(), self.thread_id)
     }
@@ -562,15 +593,19 @@ impl LiveSession {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 if !will_retry {
-                    let msg = params
-                        .get("error")
-                        .and_then(|e| {
-                            e.get("message")
-                                .and_then(Value::as_str)
-                                .or_else(|| e.as_str())
-                        })
+                    let error = params.get("error").cloned().unwrap_or(Value::Null);
+                    let msg = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .or_else(|| error.as_str())
                         .unwrap_or("upstream error");
                     self.pending_error = Some(msg.chars().take(300).collect());
+                    if let Some(fault) = error
+                        .get("codexErrorInfo")
+                        .and_then(crate::accounts::classify)
+                    {
+                        self.pending_fault = Some(fault);
+                    }
                 }
             }
             _ => {}
@@ -678,6 +713,14 @@ impl LiveSession {
                             .to_string()
                     })
                     .unwrap_or_else(|| "completed".to_string());
+                if let Some(fault) = params
+                    .get("turn")
+                    .and_then(|t| t.get("error"))
+                    .and_then(|e| e.get("codexErrorInfo"))
+                    .and_then(crate::accounts::classify)
+                {
+                    self.pending_fault = Some(fault);
+                }
                 let err = params
                     .get("turn")
                     .and_then(|t| t.get("error"))
@@ -1053,6 +1096,7 @@ impl LiveSession {
         self.out.clear();
         self.items.clear();
         self.pending_error = None;
+        self.pending_fault = None;
         self.current_turn_id = None;
         self.usage_turn_start = self.usage_total.clone();
     }
@@ -1196,6 +1240,7 @@ fn sweep() {
         let newest = due
             && !pool.iter().any(|o| {
                 !o.closed
+                    && o.account == s.account
                     && o.surface == s.surface
                     && o.model == s.model
                     && o.effort == s.effort
@@ -1275,6 +1320,8 @@ pub struct Record {
     /// Unix seconds when written; restores the warm-window clock.
     #[serde(default)]
     pub saved_at: u64,
+    #[serde(default)]
+    pub account: String,
 }
 
 /// `$XDG_CACHE_HOME/codex-sub` (or `~/.cache/codex-sub`).
@@ -1407,6 +1454,7 @@ pub fn save_record(turn: &PreparedTurn, s: &LiveSession) {
         absorbed: s.absorbed.clone(),
         reply_call_ids: s.reply_call_ids.clone(),
         reply_text: s.reply_text.clone(),
+        account: s.account.clone(),
         saved_at: SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1419,19 +1467,15 @@ pub fn save_record(turn: &PreparedTurn, s: &LiveSession) {
         return;
     }
     touch_ledger(&rec.sid);
-    sweep_if_due(
-        &cache_root(),
-        &setup::codex_home().join("sessions"),
-        SystemTime::now(),
-    );
+    sweep_if_due(&cache_root(), &session_roots(), SystemTime::now());
 }
 
 /// The rollout file for `sid`: `sessions/YYYY/MM/DD/rollout-…-<sid>.jsonl`
 /// under the child's CODEX_HOME. A record whose rollout was swept can't
 /// resume, so resume paths check this first.
-fn rollout_file(sid: &str) -> Option<PathBuf> {
+fn rollout_file(sid: &str, home: &Path) -> Option<PathBuf> {
     let suffix = format!("{sid}.jsonl");
-    let mut dirs = vec![setup::codex_home().join("sessions")];
+    let mut dirs = vec![home.join("sessions")];
     while let Some(d) = dirs.pop() {
         for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
             let p = e.path();
@@ -1451,8 +1495,25 @@ fn rollout_file(sid: &str) -> Option<PathBuf> {
 }
 
 /// Whether the CLI's rollout for `sid` is still on disk.
-fn session_exists(sid: &str) -> bool {
-    is_uuid(sid) && rollout_file(sid).is_some()
+fn session_exists(sid: &str, home: &Path) -> bool {
+    is_uuid(sid) && rollout_file(sid, home).is_some()
+}
+
+fn record_home(label: &str) -> Option<PathBuf> {
+    if label.is_empty() {
+        return Some(setup::codex_home());
+    }
+    crate::accounts::resolve(label).map(|p| p.home)
+}
+
+fn session_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = std::iter::once(setup::codex_home())
+        .chain(crate::accounts::picks().into_iter().map(|p| p.home))
+        .map(|home| home.join("sessions"))
+        .collect();
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 /// Mark thread `sid` as ours, so the sweep reclaims its rollout even if
@@ -1477,7 +1538,7 @@ fn idle_past(path: &Path, now: SystemTime, ttl: Duration) -> bool {
 
 /// At most once per [`SWEEP_EVERY`] (marker `root/.swept`), run
 /// [`sweep_records`].
-fn sweep_if_due(root: &Path, sessions: &Path, now: SystemTime) {
+fn sweep_if_due(root: &Path, sessions: &[PathBuf], now: SystemTime) {
     let marker = root.join(".swept");
     if marker.exists() && !idle_past(&marker, now, SWEEP_EVERY) {
         return;
@@ -1490,7 +1551,7 @@ fn sweep_if_due(root: &Path, sessions: &Path, now: SystemTime) {
 /// Delete resume files and ledger entries idle past `ttl`, plus the
 /// rollouts of ledgered thread ids — only threads this plugin created,
 /// never a user's own sessions in a pinned CODEX_HOME.
-fn sweep_records(root: &Path, sessions: &Path, now: SystemTime, ttl: Duration) {
+fn sweep_records(root: &Path, sessions: &[PathBuf], now: SystemTime, ttl: Duration) {
     let entries = |d: PathBuf| {
         std::fs::read_dir(d)
             .into_iter()
@@ -1514,19 +1575,21 @@ fn sweep_records(root: &Path, sessions: &Path, now: SystemTime, ttl: Duration) {
         }
         let _ = std::fs::remove_file(&p);
         let suffix = format!("{name}.jsonl");
-        let mut dirs = vec![sessions.to_path_buf()];
-        while let Some(d) = dirs.pop() {
-            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-                let f = e.path();
-                if f.is_dir() {
-                    dirs.push(f);
-                } else if f
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .ends_with(&suffix)
-                {
-                    let _ = std::fs::remove_file(&f);
+        for session_root in sessions {
+            let mut dirs = vec![session_root.clone()];
+            while let Some(d) = dirs.pop() {
+                for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                    let f = e.path();
+                    if f.is_dir() {
+                        dirs.push(f);
+                    } else if f
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .ends_with(&suffix)
+                    {
+                        let _ = std::fs::remove_file(&f);
+                    }
                 }
             }
         }
@@ -1550,6 +1613,7 @@ fn spawn_resumed(
         surface: rec.surface.clone(),
         native_model: rec.model.clone(),
         effort: rec.effort.clone(),
+        account: crate::accounts::resolve(&rec.account),
     };
     let mut s = spawn_child(&turn, cancel)?;
     s.handshake_resume(rec, deadline)?;
@@ -1586,9 +1650,12 @@ pub fn rewarm() {
         if age > WARM_WINDOW {
             break;
         }
+        let Some(home) = record_home(&rec.account) else {
+            continue;
+        };
         // A sid-only record carries no continuation state — it remains a
         // cold-resume point (`claim_record`), never a pooled session.
-        if rec.absorbed.is_empty() || !session_exists(&rec.sid) {
+        if rec.absorbed.is_empty() || !session_exists(&rec.sid, &home) {
             continue;
         }
         {
@@ -1618,6 +1685,9 @@ pub fn claim_record(
     cancel: &Arc<AtomicBool>,
 ) -> Option<(LiveSession, Claim)> {
     let rec = load(conversation_key(turn))?;
+    if rec.account != turn.account_label() {
+        return None;
+    }
     if !rec.absorbed.is_empty()
         && (rec.surface != turn.surface
             || rec.model != turn.native_model
@@ -1628,7 +1698,7 @@ pub fn claim_record(
         // to verify — it resumes blind.
         return None;
     }
-    if !session_exists(&rec.sid) {
+    if !session_exists(&rec.sid, &record_home(&rec.account)?) {
         return None;
     }
     {

@@ -92,6 +92,23 @@ fn main() {
         return;
     }
 
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("account")) {
+        let args: Vec<String> = std::env::args_os()
+            .skip(2)
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        match codex_sub::accounts::command(&args, true) {
+            Ok(text) => {
+                println!("{text}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("status")) {
         println!("{}", codex_sub::status::text());
         return;
@@ -566,12 +583,25 @@ async fn chat_turn(relays: &relay::Intents, params: Value) -> Result<Value, Prov
     if setup::resolve_command().is_none() {
         return Err(ProviderRpcError::Unavailable(setup::INSTALL_HINT.into()));
     }
-    if !setup::cli_login_present() {
-        return Err(ProviderRpcError::Unavailable(setup::LOGIN_HINT.into()));
+    let account = codex_sub::accounts::pick().map_err(ProviderRpcError::Unavailable)?;
+    let serving = match &account {
+        Some(p) => p.home.clone(),
+        None => setup::codex_home(),
+    };
+    if !setup::cli_login_present_at(&serving) {
+        return Err(ProviderRpcError::Unavailable(match &account {
+            Some(p) => format!(
+                "Codex account {:?} has no login in {}",
+                p.label,
+                p.home.display()
+            ),
+            None => setup::LOGIN_HINT.into(),
+        }));
     }
     let bearer = format!("codex-sub-{}", chat::rand_hex(16));
     let intent = relay::RelayIntent {
         model: model.clone(),
+        account,
     };
     relays
         .lock()

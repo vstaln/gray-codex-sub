@@ -2,6 +2,7 @@
 //! modules over the sidecar wire; the host tests import the exact same
 //! provider declaration so validation is version-locked by tests.
 
+pub mod accounts;
 pub mod appserver;
 pub mod chat;
 pub mod manifest;
