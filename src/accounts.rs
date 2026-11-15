@@ -228,7 +228,10 @@ pub fn pick(excluded: &BTreeSet<String>) -> Result<Account, String> {
             let why = if h.last_error.is_empty() {
                 String::new()
             } else {
-                format!(" — last error: {}", h.last_error.chars().take(160).collect::<String>())
+                format!(
+                    " — last error: {}",
+                    h.last_error.chars().take(160).collect::<String>()
+                )
             };
             return Err(format!(
                 "all codex accounts are cooling; earliest retry for '{}' in {wait}s{why}",
@@ -307,7 +310,11 @@ pub fn failure_bench(err: &str, sole: bool) -> Option<u64> {
     // A declared reset (Retry-After, resets-at) wins over the computed
     // TTL — the provider knows its own window.
     let until = retry_after(&m, now).unwrap_or(now + ttl);
-    Some(if sole { until.min(now + SOLE_CAP_SECS) } else { until })
+    Some(if sole {
+        until.min(now + SOLE_CAP_SECS)
+    } else {
+        until
+    })
 }
 
 /// Pull an upstream-declared reset out of an error message: explicit
@@ -460,10 +467,17 @@ fn list(state: &State) -> String {
                 flags.push(h.status.clone());
             }
             if h.request_count > 0 {
-                flags.push(format!("{} reqs, last {}", h.request_count, ago(now, h.last_used_at)));
+                flags.push(format!(
+                    "{} reqs, last {}",
+                    h.request_count,
+                    ago(now, h.last_used_at)
+                ));
             }
             if !h.last_error.is_empty() && h.cooled_until > now {
-                flags.push(format!("err: {}", h.last_error.chars().take(80).collect::<String>()));
+                flags.push(format!(
+                    "err: {}",
+                    h.last_error.chars().take(80).collect::<String>()
+                ));
             }
         }
         let tag = if a.implicit { " (implicit)" } else { "" };

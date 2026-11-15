@@ -345,9 +345,7 @@ fn run_turn(
                         crate::accounts::mark_cooled(&account, &e, until);
                         excluded.insert(account.label.clone());
                         if excluded.len() >= pool_n {
-                            return Err(format!(
-                                "all {pool_n} codex account(s) failed: {e}"
-                            ));
+                            return Err(format!("all {pool_n} codex account(s) failed: {e}"));
                         }
                         last_err = e;
                     }
