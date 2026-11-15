@@ -285,7 +285,7 @@ pub fn any_login() -> bool {
 /// for errors that must not cool anything.
 pub fn failure_bench(err: &str, sole: bool) -> Option<u64> {
     let m = err.to_lowercase();
-    let ttl = if m.contains("429")
+    let ttl = if crate::has_status(&m, "429")
         || m.contains("rate limit")
         || m.contains("rate_limit")
         || m.contains("ratelimit")
@@ -294,7 +294,7 @@ pub fn failure_bench(err: &str, sole: bool) -> Option<u64> {
         || m.contains("quota")
     {
         RATE_TTL_SECS
-    } else if m.contains("401")
+    } else if crate::has_status(&m, "401")
         || m.contains("unauthorized")
         || m.contains("not logged in")
         || m.contains("not signed in")

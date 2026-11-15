@@ -260,5 +260,5 @@ pub fn is_auth_error(msg: &str) -> bool {
         || m.contains("not logged in")
         || m.contains("not signed in")
         || m.contains("authentication required")
-        || m.contains("401")
+        || crate::has_status(&m, "401")
 }
