@@ -29,7 +29,7 @@ pub fn manifest() -> gray_plugin::Manifest {
         protocol: Some("1.2".to_string()),
         subcommands: Vec::new(),
         capabilities: vec![PROVIDER_CREDENTIALS.to_string()],
-        providers: vec![provider()],
+        providers: vec![provider(), plan_provider()],
         provider_errors: Vec::new(),
     }
 }
@@ -125,3 +125,40 @@ pub fn auth_method() -> AuthMethodDecl {
 #[path = "manifest_tests.rs"]
 #[cfg(test)]
 mod tests;
+fn plan_provider() -> ProviderDecl {
+    ProviderDecl {
+        id: "chatgpt".to_string(),
+        name: "ChatGPT plan".to_string(),
+        transport: ProviderTransportDecl {
+            kind: "openai-responses".to_string(),
+            base_url: "https://api.openai.com/v1".parse().expect("resource URL"),
+            authorization: gray_plugin::ProviderAuthorizationDecl {
+                kind: "bearer".to_string(),
+                secret_name: "access_token".to_string(),
+            },
+            request: ProviderRequestPolicyDecl {
+                prompt_cache_key: true,
+                warm_replay: false,
+                store: false,
+                include_reasoning_encrypted: true,
+                previous_response_id: false,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                text_verbosity: None,
+                cache_ttl_secs: None,
+            },
+            headers: Vec::new(),
+        },
+        auth_methods: vec![AuthMethodDecl {
+            id: "chatgpt-plan".to_string(),
+            name: "Sign in with ChatGPT".to_string(),
+            kind: "oauth".to_string(),
+            operations: vec![
+                "login".to_string(),
+                "refresh".to_string(),
+                "revoke".to_string(),
+                "models".to_string(),
+            ],
+        }],
+    }
+}

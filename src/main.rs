@@ -53,15 +53,18 @@ struct Response {
     error: Option<Value>,
 }
 
+mod plan;
+
 /// State the request handlers share; built inside `serve` so its pieces
 /// stay plain values (nothing here touches the OS).
 struct Shared {
     relays: relay::Intents,
+    plan: std::sync::OnceLock<Result<plan::Plan, ProviderRpcError>>,
 }
 
 fn cli_help() -> String {
     "codex-sub — ChatGPT/Codex subscription provider for gray\n\
-     usage: codex-sub manifest | sidecar | status | account [add|list|use|remove] | tools [all|bash|+name|-name|name …]\n\
+     usage: codex-sub manifest | sidecar | status | forget-chatgpt | account [add|list|use|remove] | tools [all|bash|+name|-name|name …]\n\
      slash:  /codex · /codex status · /codex tools … · /codex account …"
         .to_string()
 }
@@ -107,6 +110,14 @@ fn main() {
                 .map(|s| s.to_string_lossy().into_owned())
                 .collect();
             println!("{}", codex_sub::accounts::command(&args, true));
+            return;
+        }
+        Some(s) if s == "forget-chatgpt" => {
+            if let Err(error) = plan::forget_registration() {
+                eprintln!("Could not reset ChatGPT registration: {error}");
+                std::process::exit(2);
+            }
+            println!("ChatGPT registration reset. Reconnect in Gray to register again.");
             return;
         }
         Some(s) if s == "status" => {
@@ -241,6 +252,7 @@ fn build_runtime() -> Option<tokio::runtime::Runtime> {
 fn serve_serial(runtime: &tokio::runtime::Runtime) {
     let shared = Shared {
         relays: Default::default(),
+        plan: Default::default(),
     };
     if let Err(e) = session::start_reaper() {
         diag(&format!(
@@ -384,6 +396,7 @@ fn write_response(
 async fn serve(mut stdin_rx: tokio::sync::mpsc::UnboundedReceiver<String>) {
     let shared = Arc::new(Shared {
         relays: Default::default(),
+        plan: Default::default(),
     });
     if let Err(e) = session::start_reaper() {
         diag(&format!(
@@ -437,6 +450,32 @@ async fn serve(mut stdin_rx: tokio::sync::mpsc::UnboundedReceiver<String>) {
 
 async fn handle(shared: &Shared, request: &Request) -> Result<Value, ProviderRpcError> {
     let params = request.params.clone().unwrap_or_else(|| json!({}));
+    let plan_auth = params.get("provider").and_then(Value::as_str) == Some("chatgpt")
+        || (matches!(
+            request.method.as_str(),
+            "provider/auth/poll" | "provider/auth/cancel"
+        ) && params
+            .get("operation_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty()));
+    if plan_auth
+        && matches!(
+            request.method.as_str(),
+            "provider/auth/start"
+                | "provider/auth/poll"
+                | "provider/auth/cancel"
+                | "provider/auth/refresh"
+                | "provider/auth/revoke"
+                | "provider/models"
+        )
+    {
+        return match shared.plan.get_or_init(plan::Plan::new) {
+            Ok(plan) => plan.handle(&request.method, params).await,
+            Err(_) => Err(ProviderRpcError::Unavailable(
+                "ChatGPT HTTP client unavailable".into(),
+            )),
+        };
+    }
     match request.method.as_str() {
         "plugin/manifest" => Ok(serde_json::to_value(manifest::manifest()).unwrap()),
         "provider/auth/start" => {
