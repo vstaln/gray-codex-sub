@@ -36,6 +36,8 @@ const KEEPALIVE: Duration = Duration::from_secs(15);
 /// How often a waiting relay checks whether the client hung up.
 const PEER_POLL: Duration = Duration::from_millis(250);
 
+const ISOLATED_HEADER: &str = "x-gray-isolated";
+
 /// The client closed its end (gray interrupted the turn). Non-blocking
 /// peek: EOF or a hard error means gone; no data yet means still there.
 fn client_gone(s: &std::net::TcpStream) -> bool {
@@ -150,6 +152,7 @@ fn handle_conn(
     let request_line = lines.next().unwrap_or("").to_string();
     let mut len = 0usize;
     let mut auth = String::new();
+    let mut isolated = false;
     for line in lines {
         let line = line.trim_end();
         if line.is_empty() {
@@ -162,6 +165,8 @@ fn handle_conn(
             len = v.trim().parse().unwrap_or(0);
         } else if name.eq_ignore_ascii_case("authorization") {
             auth = v.trim().to_string();
+        } else if name.eq_ignore_ascii_case(ISOLATED_HEADER) {
+            isolated = v.trim() == "1";
         }
     }
     let header_end = head
@@ -218,7 +223,7 @@ fn handle_conn(
         let spawned = std::thread::Builder::new()
             .name("codex-sub-turn".into())
             .spawn(move || {
-                let _ = tx.send(run_turn(&intents, &bearer, &body, &cancel));
+                let _ = tx.send(run_turn(&intents, &bearer, &body, &cancel, isolated));
             });
         if let Err(e) = spawned {
             let body = json!({"type": "error", "error": {
@@ -301,6 +306,7 @@ fn run_turn(
     bearer: &str,
     raw: &[u8],
     cancel: &Arc<AtomicBool>,
+    isolated: bool,
 ) -> Result<Vec<u8>, String> {
     let intent = intents
         .lock()
@@ -330,7 +336,7 @@ fn run_turn(
             }
         };
         turn.home = account.home.clone();
-        match crate::chat::run_turn(&turn, cancel, Duration::from_secs(600)) {
+        match crate::chat::run_turn(&turn, cancel, Duration::from_secs(600), isolated) {
             Ok(result) => {
                 crate::accounts::note_used(&account);
                 return crate::chat::fold_result(&result, &intent.model);

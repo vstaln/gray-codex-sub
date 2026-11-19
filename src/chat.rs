@@ -106,6 +106,15 @@ fn assistant_side(item: &Value) -> bool {
     }
 }
 
+fn side_call(isolated: bool, input: &[Value]) -> bool {
+    isolated
+        && !input.iter().any(|i| {
+            matches!(item_kind(i), "function_call" | "function_call_output")
+                || (item_kind(i) == "message"
+                    && i.get("role").and_then(Value::as_str) == Some("assistant"))
+        })
+}
+
 fn text_of(blocks: &Value) -> String {
     match blocks {
         Value::String(s) => s.clone(),
@@ -552,8 +561,12 @@ pub fn run_turn(
     turn: &PreparedTurn,
     cancel: &Arc<AtomicBool>,
     timeout: Duration,
+    isolated: bool,
 ) -> Result<TurnResult, String> {
     let deadline = Instant::now() + timeout;
+    if side_call(isolated, &turn.input) {
+        return side_turn(turn, deadline, cancel);
+    }
     let (claimed, reason) = session::take(turn, cancel);
     // Pool miss: a persisted record may still resume this conversation's
     // thread as a strict continuation (post-restart, or an overflowed
@@ -591,6 +604,17 @@ pub fn run_turn(
         }
         None => fresh_turn(turn, reason, deadline, cancel),
     }
+}
+
+fn side_turn(
+    turn: &PreparedTurn,
+    deadline: Instant,
+    cancel: &Arc<AtomicBool>,
+) -> Result<TurnResult, String> {
+    let mut s = session::spawn(turn, deadline, cancel)?;
+    let r = s.drive_fresh(turn, deadline, cancel);
+    s.close();
+    r
 }
 
 /// Cold start: spawn a fresh `codex app-server` child and drive the

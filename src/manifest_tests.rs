@@ -10,7 +10,7 @@ fn manifest_matches_protocol_12_contract() {
         manifest.capabilities,
         vec![PROVIDER_CREDENTIALS.to_string()]
     );
-    assert_eq!(manifest.providers.len(), 1);
+    assert_eq!(manifest.providers.len(), 2);
     let provider = &manifest.providers[0];
     assert_eq!(provider.id, PROVIDER_ID);
     // Relay transport: the real per-turn URL comes back in provider/chat's
@@ -66,7 +66,7 @@ fn manifest_passes_host_protocol_validation() {
         manifest.capabilities,
         vec![PROVIDER_CREDENTIALS.to_string()]
     );
-    assert_eq!(manifest.providers.len(), 1);
+    assert_eq!(manifest.providers.len(), 2);
     let provider = &manifest.providers[0];
     assert_eq!(provider.id, "codex");
     assert_eq!(provider.transport.base_url.as_str(), "https://127.0.0.1:1/");

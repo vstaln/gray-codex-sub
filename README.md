@@ -14,7 +14,13 @@ key. It is a protocol-1.2 provider sidecar: gray owns the agent loop, tools,
 approvals, and compaction — the plugin drives pooled `codex app-server`
 children, the Codex CLI's own engine, behind a per-turn loopback relay.
 
-## Requirements
+## ChatGPT plan sign-in
+
+Select **ChatGPT plan** in Gray’s `/connect` menu to use the direct Responses API with your ChatGPT subscription. This flow is bundled with the Codex CLI provider and is based on Daniel Ou’s `gray-chatgpt` plugin.
+
+After updating both Gray and this plugin, remove the standalone `chatgpt` plugin with `gray plugin remove chatgpt`. Gray migrates the existing sign-in when it first connects through the bundled provider.
+
+## Codex CLI requirements
 
 - Codex CLI on `PATH` (>= 0.154), or set
   `GRAY_CODEX_SUB_COMMAND=/path/to/codex`.
@@ -26,7 +32,7 @@ children, the Codex CLI's own engine, behind a per-turn loopback relay.
 
   Or point `CODEX_HOME` at your existing Codex login (e.g. `~/.codex`).
 
-## What the plugin does and does not do
+## Codex CLI behavior
 
 - **Reads no tokens.** It never opens `$CODEX_HOME/auth.json` (existence
   check only, for a fast error message) and runs no OAuth flow of its own.
