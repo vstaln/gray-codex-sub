@@ -125,7 +125,7 @@ pub fn auth_method() -> AuthMethodDecl {
 #[path = "manifest_tests.rs"]
 #[cfg(test)]
 mod tests;
-fn plan_provider() -> ProviderDecl {
+pub fn plan_provider() -> ProviderDecl {
     ProviderDecl {
         id: "chatgpt".to_string(),
         name: "ChatGPT plan".to_string(),

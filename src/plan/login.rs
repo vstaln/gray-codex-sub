@@ -226,15 +226,7 @@ impl Flow {
             &self.attempt.nonce,
         )
         .await?;
-        if let Some(saved) = self.saved.as_ref().and_then(|r| r.subject.as_deref())
-            && saved != identity.subject
-        {
-            return Err(failure(
-                "account_changed",
-                "That is a different ChatGPT account than this Gray install is registered to. \
-                 Run `codex-sub forget-chatgpt`, then /connect again to switch accounts.",
-            ));
-        }
+
         if !tokens.scopes().contains(&oauth::PLAN_USAGE_SCOPE) {
             return Err(failure(
                 "plan_usage_not_granted",
@@ -333,4 +325,49 @@ async fn respond(socket: &mut TcpStream, status: u16, body: Body<'_>) -> std::io
     );
     socket.write_all(response.as_bytes()).await?;
     socket.flush().await
+}
+
+
+pub async fn interactive_login(
+    endpoints: &Endpoints,
+    state: &StateFile,
+    http: &reqwest::Client,
+    label: &str,
+) -> Result<CredentialMaterial, String> {
+    let host_id = format!("urn:uuid:{}", uuid::Uuid::new_v4().hyphenated());
+    let listener = bind_loopback().await.map_err(|e| e.to_string())?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("login callback unavailable: {e}"))?
+        .port();
+    let attempt = Attempt::new(None, port);
+    let url = oauth::authorization_url(endpoints, &attempt, &host_id, None);
+    println!("Sign in with ChatGPT for '{label}':\n  {url}\n\nWaiting for browser sign-in...");
+    open_browser(url.as_str());
+    let flow = Flow {
+        endpoints: endpoints.clone(),
+        state: state.clone(),
+        http: http.clone(),
+        attempt,
+        saved: None,
+    };
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(oauth::LOGIN_TTL_SECS));
+    tokio::select! {
+        _ = deadline => Err("Sign-in timed out.".to_string()),
+        res = flow.run(listener) => res.map_err(|f| f.message),
+    }
+}
+
+fn open_browser(url: &str) {
+    let prog = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(prog)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }

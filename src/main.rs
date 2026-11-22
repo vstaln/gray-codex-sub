@@ -104,11 +104,23 @@ fn main() {
         // `account` on the argv path may drive `codex login`
         // interactively — stdio is the user's terminal here, unlike the
         // sidecar wire.
-        Some(a) if a == "account" => {
+        Some(a) if a == "account" || a == "accounts" => {
             let args: Vec<String> = std::env::args_os()
                 .skip(2)
                 .map(|s| s.to_string_lossy().into_owned())
                 .collect();
+            if plan::has_plan_pool() {
+                match plan::command(&args) {
+                    Ok(out) => {
+                        println!("{out}");
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(2);
+                    }
+                }
+            }
             println!("{}", codex_sub::accounts::command(&args, true));
             return;
         }
