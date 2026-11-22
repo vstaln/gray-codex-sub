@@ -171,15 +171,21 @@ fn pool_in(state: &State) -> Vec<Account> {
     if env_pinned() || state.accounts.is_empty() {
         return vec![implicit()];
     }
-    state
+    let mut out = Vec::new();
+    let imp = implicit();
+    let dup = state
         .accounts
         .iter()
-        .map(|e| Account {
-            label: e.label.clone(),
-            home: PathBuf::from(&e.home),
-            implicit: false,
-        })
-        .collect()
+        .any(|e| e.label == imp.label || PathBuf::from(&e.home) == imp.home);
+    if !dup && crate::setup::login_present(&imp.home) {
+        out.push(imp);
+    }
+    out.extend(state.accounts.iter().map(|e| Account {
+        label: e.label.clone(),
+        home: PathBuf::from(&e.home),
+        implicit: false,
+    }));
+    out
 }
 
 /// The account pool as it stands right now.
@@ -677,6 +683,7 @@ pub fn command(args: &[String], allow_login: bool) -> String {
         Some("use") => use_account(&args[1..]),
         Some("remove") | Some("rm") => remove(&args[1..]),
         Some("usage") => usage_cmd(&args[1..]),
+        Some("list") | None if args.iter().any(|a| a == "--json") => list_json(&load()),
         Some("list") | None => format!("{}\n\n{ACCOUNT_USAGE}", list(&load())),
         Some("help") | Some("--help") | Some("-h") => ACCOUNT_USAGE.to_string(),
         Some(other) => format!("unknown account verb {other:?}\n\n{ACCOUNT_USAGE}"),
@@ -736,4 +743,28 @@ fn usage_cmd(args: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn list_json(state: &State) -> String {
+    let items = pool_in(state);
+    let accounts: Vec<serde_json::Value> = items
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "label": a.label,
+                "home": a.home.display().to_string(),
+                "implicit": a.implicit,
+                "pinned": state.preferred.as_deref() == Some(a.label.as_str()),
+                "cooling": cooled(state, &a.home, now_secs()),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "version": 1,
+        "provider": "codex-sub",
+        "strategy": state.strategy,
+        "ambient": false,
+        "accounts": accounts,
+    })
+    .to_string()
 }
