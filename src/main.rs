@@ -616,7 +616,9 @@ async fn handle(shared: &Shared, request: &Request) -> Result<Value, ProviderRpc
                         .collect()
                 })
                 .unwrap_or_default();
-            if argv.first().map(String::as_str) == Some("status") {
+            if (name == manifest::CODEX_COMMAND || name == manifest::CHATGPT_COMMAND)
+                && argv.first().map(String::as_str) == Some("status")
+            {
                 return Ok(json!({"text": blocking(codex_sub::status::text).await?}));
             }
             manifest::run_command(name, &argv)

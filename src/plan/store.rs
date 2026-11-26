@@ -156,7 +156,8 @@ pub fn accounts() -> Vec<Account> {
 
 fn mutate_pool<T>(f: impl FnOnce(&mut Value) -> Result<T, String>) -> Result<T, String> {
     let path = auth_path().ok_or("cannot resolve GRAY_HOME")?;
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let mut store: Value =
         serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
     let binding = crate::manifest::plan_provider()
@@ -199,7 +200,8 @@ fn write_private_json(path: &Path, val: &Value) -> Result<(), String> {
     use std::io::Write;
     tmp.write_all(&bytes).map_err(|e| e.to_string())?;
     tmp.as_file().sync_all().map_err(|e| e.to_string())?;
-    tmp.persist(path).map_err(|e| format!("persist {}: {}", path.display(), e.error))?;
+    tmp.persist(path)
+        .map_err(|e| format!("persist {}: {}", path.display(), e.error))?;
     Ok(())
 }
 
@@ -319,7 +321,12 @@ pub fn set_strategy(strategy: &str) -> Result<String, String> {
 pub fn find_codex_cli_token(label: &str, email: Option<&str>) -> Option<(String, Option<String>)> {
     let mut candidates = Vec::new();
     if let Some(gh) = gray_home() {
-        candidates.push(gh.join("codex-sub").join("accounts").join(label).join("auth.json"));
+        candidates.push(
+            gh.join("codex-sub")
+                .join("accounts")
+                .join(label)
+                .join("auth.json"),
+        );
         if let Ok(rd) = std::fs::read_dir(gh.join("codex-sub").join("accounts")) {
             for ent in rd.flatten() {
                 candidates.push(ent.path().join("auth.json"));
@@ -347,8 +354,12 @@ pub fn find_codex_cli_token(label: &str, email: Option<&str>) -> Option<(String,
             .get("account_id")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let tok_email = jwt_email(access)
-            .or_else(|| tokens.get("id_token").and_then(Value::as_str).and_then(jwt_email));
+        let tok_email = jwt_email(access).or_else(|| {
+            tokens
+                .get("id_token")
+                .and_then(Value::as_str)
+                .and_then(jwt_email)
+        });
         if let Some(want_email) = email {
             if tok_email
                 .as_deref()

@@ -214,7 +214,10 @@ pub fn command(args: &[String]) -> Result<String, String> {
                 .ok_or_else(|| "account remove needs a label".to_string())?;
             store::remove_account(label)?;
             if json_mode {
-                Ok(json!({"ok": true, "message": format!("account {label:?} removed")}).to_string())
+                Ok(
+                    json!({"ok": true, "message": format!("account {label:?} removed")})
+                        .to_string(),
+                )
             } else {
                 Ok(format!("removed account '{label}'"))
             }
@@ -240,8 +243,7 @@ fn add_interactive(label: &str, json_mode: bool) -> Result<String, String> {
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
-    let material =
-        runtime.block_on(login::interactive_login(&endpoints, &state, &http, label))?;
+    let material = runtime.block_on(login::interactive_login(&endpoints, &state, &http, label))?;
     let who = store::upsert_account(label, &material)?;
     if json_mode {
         Ok(json!({
@@ -329,7 +331,9 @@ pub fn usage_json(want: Option<&str>) -> String {
             if want.is_some_and(|want| want != account.label) {
                 continue;
             }
-            if account.expires_at.is_some_and(|exp| exp <= now.saturating_add(60))
+            if account
+                .expires_at
+                .is_some_and(|exp| exp <= now.saturating_add(60))
                 && let (Some(cid), Some(rt)) = (
                     account.client_id.as_deref(),
                     account.refresh_token.as_deref(),

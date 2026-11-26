@@ -327,7 +327,6 @@ async fn respond(socket: &mut TcpStream, status: u16, body: Body<'_>) -> std::io
     socket.flush().await
 }
 
-
 pub async fn interactive_login(
     endpoints: &Endpoints,
     state: &StateFile,

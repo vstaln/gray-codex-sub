@@ -13,18 +13,51 @@ pub const PROVIDER_ID: &str = "codex";
 pub const AUTH_METHOD_ID: &str = "chatgpt-subscription";
 /// The operator command: `/codex tools …` owns the tool allowlist.
 pub const CODEX_COMMAND: &str = "/codex";
+pub const CHATGPT_COMMAND: &str = "/chatgpt";
 
-/// A protocol-1.2 manifest value. Gray validates every provider and
-/// malformed peers independently; this plugin ships exactly one valid
-/// provider with the reference request policy. The auth method keeps
-/// kind `oauth`: the sign-in is an external (CLI-run) OAuth flow the
-/// host treats the same way.
+const OPERATOR_COMPLETIONS: &[(&str, &str)] = &[
+    (
+        "status",
+        "show Codex/ChatGPT login, plan, and quota windows",
+    ),
+    ("tools", "show or set upstream harness tool allowlist"),
+    ("tools all", "allow every harness tool the host sends"),
+    ("tools bash", "allow bash only"),
+    ("account", "manage Codex/ChatGPT logins"),
+    ("account list", "list Codex/ChatGPT accounts"),
+    ("account usage", "show Codex/ChatGPT account quota usage"),
+    ("account use", "pin a Codex/ChatGPT account"),
+    ("account remove", "remove a Codex/ChatGPT account"),
+    ("account add", "register an already-logged-in account"),
+];
+
+pub fn sync_completion_file() {
+    let Some(home) = gray_core::paths::gray_home() else {
+        return;
+    };
+    let entries: Vec<serde_json::Value> = OPERATOR_COMPLETIONS
+        .iter()
+        .map(|(arg, desc)| serde_json::json!({"arg": arg, "description": desc}))
+        .collect();
+    let Ok(bytes) = serde_json::to_vec(&serde_json::json!({"completion": entries})) else {
+        return;
+    };
+    let plugins_dir = home.join("plugins");
+    let _ = std::fs::create_dir_all(&plugins_dir);
+    let path = plugins_dir.join(format!("{PLUGIN_NAME}-completion.json"));
+    let tmp = plugins_dir.join(format!("{PLUGIN_NAME}-completion.json.tmp"));
+    if std::fs::write(&tmp, &bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
 pub fn manifest() -> gray_plugin::Manifest {
+    sync_completion_file();
     gray_plugin::Manifest {
         name: PLUGIN_NAME.to_string(),
         version: PLUGIN_VERSION.to_string(),
         tools: Vec::new(),
-        commands: vec![CODEX_COMMAND.to_string()],
+        commands: vec![CODEX_COMMAND.to_string(), CHATGPT_COMMAND.to_string()],
         hooks: Vec::new(),
         protocol: Some("1.2".to_string()),
         subcommands: Vec::new(),
@@ -34,14 +67,8 @@ pub fn manifest() -> gray_plugin::Manifest {
     }
 }
 
-/// `command/run` result for a claimed command, `None` for names this
-/// sidecar doesn't answer. A bare `/codex` answers nothing (`{}`) so the
-/// host falls back to the provider-login shortcut — connect → model
-/// picker on Codex's rows, i.e. "switch to Codex" — while
-/// `/codex tools …` owns the tool allowlist (see [`crate::settings`]),
-/// answered as `{"text": …}`.
 pub fn run_command(name: &str, argv: &[String]) -> Option<serde_json::Value> {
-    if name == CODEX_COMMAND {
+    if name == CODEX_COMMAND || name == CHATGPT_COMMAND {
         if argv.is_empty() {
             return Some(serde_json::json!({}));
         }
