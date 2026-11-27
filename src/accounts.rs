@@ -176,7 +176,7 @@ fn pool_in(state: &State) -> Vec<Account> {
     let dup = state
         .accounts
         .iter()
-        .any(|e| e.label == imp.label || PathBuf::from(&e.home) == imp.home);
+        .any(|e| e.label == imp.label || imp.home == std::path::Path::new(&e.home));
     if !dup && crate::setup::login_present(&imp.home) {
         out.push(imp);
     }
