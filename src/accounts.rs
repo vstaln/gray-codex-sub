@@ -171,15 +171,21 @@ fn pool_in(state: &State) -> Vec<Account> {
     if env_pinned() || state.accounts.is_empty() {
         return vec![implicit()];
     }
-    state
+    let mut out = Vec::new();
+    let imp = implicit();
+    let dup = state
         .accounts
         .iter()
-        .map(|e| Account {
-            label: e.label.clone(),
-            home: PathBuf::from(&e.home),
-            implicit: false,
-        })
-        .collect()
+        .any(|e| e.label == imp.label || imp.home == std::path::Path::new(&e.home));
+    if !dup && crate::setup::login_present(&imp.home) {
+        out.push(imp);
+    }
+    out.extend(state.accounts.iter().map(|e| Account {
+        label: e.label.clone(),
+        home: PathBuf::from(&e.home),
+        implicit: false,
+    }));
+    out
 }
 
 /// The account pool as it stands right now.
@@ -676,8 +682,89 @@ pub fn command(args: &[String], allow_login: bool) -> String {
         Some("add") => add(&args[1..], allow_login),
         Some("use") => use_account(&args[1..]),
         Some("remove") | Some("rm") => remove(&args[1..]),
+        Some("usage") => usage_cmd(&args[1..]),
+        Some("list") | None if args.iter().any(|a| a == "--json") => list_json(&load()),
         Some("list") | None => format!("{}\n\n{ACCOUNT_USAGE}", list(&load())),
         Some("help") | Some("--help") | Some("-h") => ACCOUNT_USAGE.to_string(),
         Some(other) => format!("unknown account verb {other:?}\n\n{ACCOUNT_USAGE}"),
     }
+}
+
+fn usage_cmd(args: &[String]) -> String {
+    let mut json_mode = false;
+    let mut target: Option<&str> = None;
+    for a in args {
+        match a.as_str() {
+            "--json" => json_mode = true,
+            "--fresh" => {}
+            other if !other.starts_with('-') && target.is_none() => target = Some(other),
+            _ => {}
+        }
+    }
+    let items: Vec<Account> = pool()
+        .into_iter()
+        .filter(|a| target.is_none_or(|t| a.label == t))
+        .collect();
+    let mut rows = Vec::new();
+    for acct in &items {
+        let res = crate::appserver::with_client_at(&acct.home, |c| {
+            let account = c.call("account/read", serde_json::json!({}))?;
+            let limits = c
+                .call("account/rateLimits/read", serde_json::json!({}))
+                .unwrap_or(serde_json::Value::Null);
+            Ok(crate::usage::card(&account, &limits))
+        });
+        match res {
+            Ok(card) => rows.push(serde_json::json!({
+                "label": acct.label,
+                "usage": card,
+            })),
+            Err(e) => rows.push(serde_json::json!({
+                "label": acct.label,
+                "error": e.to_string(),
+            })),
+        }
+    }
+    if json_mode {
+        return serde_json::json!({
+            "provider": "codex-sub",
+            "accounts": rows,
+        })
+        .to_string();
+    }
+    rows.iter()
+        .map(|r| {
+            let label = r["label"].as_str().unwrap_or("?");
+            if let Some(err) = r["error"].as_str() {
+                format!("{label}: {err}")
+            } else {
+                format!("{label}: {}", r["usage"])
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn list_json(state: &State) -> String {
+    let items = pool_in(state);
+    let accounts: Vec<serde_json::Value> = items
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "label": a.label,
+                "home": a.home.display().to_string(),
+                "implicit": a.implicit,
+                "pinned": state.preferred.as_deref() == Some(a.label.as_str()),
+                "cooling": cooled(state, &a.home, now_secs()),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "version": 1,
+        "provider": "codex-sub",
+        "strategy": state.strategy,
+        "ambient": false,
+        "accounts": accounts,
+    })
+    .to_string()
 }
